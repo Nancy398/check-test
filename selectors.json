@@ -1,6 +1,6 @@
 {
   "fields": {
-    "company": [
+    "Maker(your company) Name": [
       "input[name=\"companyName\"]",
       "input[name=\"company\"]",
       "input[placeholder*=\"Company\" i]"
