@@ -7,3 +7,4 @@ google-auth
 PyPDF2
 
 playwright>=1.50
+chromium
