@@ -3,6 +3,7 @@ import io
 import json
 import os
 from pathlib import Path
+import shutil
 
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
 
@@ -36,7 +37,18 @@ def generate_check(data, accept_terms=False):
     cfg = json.loads(CONFIG.read_text(encoding="utf-8"))
     screenshot = None
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True, args=["--no-sandbox"])
+        chromium_path = shutil.which("chromium") or shutil.which("chromium-browser")
+
+        if not chromium_path:
+            raise RuntimeError(
+                "Chromium not found. Please add 'chromium' to packages.txt."
+            )
+        
+        browser = p.chromium.launch(
+            headless=True,
+            executable_path=chromium_path,
+            args=["--no-sandbox", "--disable-dev-shm-usage"],
+        )
         context = browser.new_context(accept_downloads=True, viewport={"width":1280,"height":1000})
         page = context.new_page()
         try:
