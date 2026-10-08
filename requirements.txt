@@ -1,0 +1,9 @@
+streamlit
+pymupdf
+num2words
+pandas
+gspread
+google-auth
+PyPDF2
+
+playwright>=1.50

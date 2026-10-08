@@ -1,0 +1,65 @@
+{
+  "fields": {
+    "company": [
+      "input[name=\"companyName\"]",
+      "input[name=\"company\"]",
+      "input[placeholder*=\"Company\" i]"
+    ],
+    "address": [
+      "textarea[name=\"address\"]",
+      "input[name=\"address\"]",
+      "textarea[placeholder*=\"address\" i]"
+    ],
+    "bank": [
+      "input[name=\"bankName\"]",
+      "input[placeholder*=\"Bank Name\" i]"
+    ],
+    "routing": [
+      "input[name=\"routingNumber\"]",
+      "input[name=\"routing\"]",
+      "input[placeholder*=\"routing\" i]"
+    ],
+    "account": [
+      "input[name=\"accountNumber\"]",
+      "input[name=\"account\"]",
+      "input[placeholder*=\"account number\" i]"
+    ],
+    "check_number": [
+      "input[name=\"checkNumber\"]",
+      "input[name=\"check_number\"]",
+      "input[placeholder*=\"check number\" i]"
+    ],
+    "date": [
+      "input[name=\"date\"]",
+      "input[placeholder*=\"date\" i]"
+    ],
+    "payee": [
+      "input[name=\"payee\"]",
+      "input[name=\"payeeName\"]",
+      "input[placeholder*=\"payee\" i]"
+    ],
+    "amount": [
+      "input[name=\"amount\"]",
+      "input[placeholder*=\"amount\" i]"
+    ],
+    "memo": [
+      "input[name=\"memo\"]",
+      "input[placeholder*=\"memo\" i]"
+    ]
+  },
+  "check_stock": [
+    "label:has-text(\"Check Stock\")",
+    "label:has-text(\"Blank Check Stock\")",
+    "input[value=\"check-stock\"]"
+  ],
+  "terms": [
+    "input[type=\"checkbox\"][name*=\"terms\" i]",
+    "label:has-text(\"Terms\") input[type=\"checkbox\"]",
+    "input[type=\"checkbox\"]"
+  ],
+  "generate": [
+    "button:has-text(\"Download\")",
+    "button:has-text(\"Generate\")",
+    "button:has-text(\"Print\")"
+  ]
+}
