@@ -9,6 +9,21 @@ from reportlab.lib.pagesizes import letter
 from reportlab.lib.units import inch
 from reportlab.pdfbase.pdfmetrics import stringWidth
 
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
+from pathlib import Path
+
+MICR_FONT_PATH = Path(__file__).resolve().parent / "micr-e13b.ttf"
+
+if MICR_FONT_PATH.exists():
+    pdfmetrics.registerFont(
+        TTFont("MICR_E13B", str(MICR_FONT_PATH))
+    )
+else:
+    raise FileNotFoundError(
+        f"MICR font not found: {MICR_FONT_PATH}"
+    )
+
 st.set_page_config(page_title="Check Management - Prototype", layout="wide")
 
 st.title("Company Check Management")
@@ -167,15 +182,15 @@ def draw_preview_check(c, row, check_number, account, preview_only=True):
     c.drawString(x + 0.22 * inch, y + 0.58 * inch, "AUTHORIZED SIGNATURE: __________________________________")
     c.drawRightString(x + w - 0.22 * inch, y + 0.58 * inch, "VOID IF NOT SIGNED")
 
-    # Deliberately do not draw a fake MICR line.
-    c.setFillGray(0.88)
-    c.rect(x + 0.15 * inch, y + 0.12 * inch, w - 0.3 * inch, 0.28 * inch, fill=1, stroke=0)
-    c.setFillGray(0.15)
-    c.setFont("Helvetica-Bold", 8)
-    c.drawCentredString(
-        x + w / 2,
+    c.setFont("MICR_E13B", 12)
+    c.setFillColorRGB(0, 0, 0)
+    
+    micr_test = f"{check_number}  123456789  0001234567"
+    
+    c.drawString(
+        x + 0.35 * inch,
         y + 0.22 * inch,
-        "MICR PLACEHOLDER — NOT A VALID MICR LINE"
+        micr_test
     )
 
     if preview_only:
