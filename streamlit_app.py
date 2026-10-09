@@ -1,92 +1,41 @@
+"""Company Check Management — single/bulk MICR layout proof (not negotiable)."""
 import io
 import re
-from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from datetime import date
-import pandas as pd
-import streamlit as st
-from reportlab.pdfgen import canvas
-from reportlab.lib.pagesizes import letter
-from reportlab.lib.units import inch
-from reportlab.pdfbase.pdfmetrics import stringWidth
-
-from reportlab.pdfbase import pdfmetrics
-from reportlab.pdfbase.ttfonts import TTFont
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
 
-import io
+import pandas as pd
 import streamlit as st
+from reportlab.lib.pagesizes import letter
+from reportlab.lib.units import inch
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.pdfgen import canvas
 
-def micr_font_test():
-    buffer = io.BytesIO()
-    c = canvas.Canvas(buffer)
-
-    c.setFont("Helvetica", 12)
-    c.drawString(60, 750, "MICR E-13B Character Test")
-
-    c.setFont("MICR_E13B", 24)
-    c.drawString(60, 690, "0123456789")
-    c.drawString(60, 630, "A B C D")
-    c.drawString(60, 570, "A123456789A")
-    c.drawString(60, 510, "B123456789B")
-    c.drawString(60, 450, "C123456789C")
-    c.drawString(60, 390, "D123456789D")
-
-    c.save()
-    return buffer.getvalue()
-
-st.download_button(
-    "Download MICR Font Test",
-    data=micr_font_test(),
-    file_name="micr_font_test.pdf",
-    mime="application/pdf"
-)
-MICR_FONT_PATH = Path(__file__).resolve().parent / "micr-e13b.ttf"
-
-if MICR_FONT_PATH.exists():
-    pdfmetrics.registerFont(
-        TTFont("MICR_E13B", str(MICR_FONT_PATH))
-    )
-else:
-    raise FileNotFoundError(
-        f"MICR font not found: {MICR_FONT_PATH}"
-    )
-
-st.set_page_config(page_title="Check Management - Prototype", layout="wide")
-
+st.set_page_config(page_title="Company Check Management", layout="wide")
 st.title("Company Check Management")
-st.caption("Prototype only — test with fictional data and plain paper. Not approved for issuing negotiable checks.")
+st.caption("MICR layout proof • Test only — not a negotiable check. Verify with your bank before production printing.")
 
-# -----------------------------
-# Session state
-# -----------------------------
+FONT_PATH = Path(__file__).resolve().parent / "micr-e13b.ttf"
+FONT_OK = False
+if FONT_PATH.is_file():
+    try:
+        pdfmetrics.registerFont(TTFont("MICR_E13B", str(FONT_PATH)))
+        FONT_OK = True
+    except Exception as exc:
+        st.error(f"MICR font could not be loaded: {exc}")
+else:
+    st.warning("micr-e13b.ttf not found next to streamlit_app.py. PDF will show a MICR placeholder.")
+
+MAP_COLUMNS = ["Property", "Company", "Bank Name", "Routing Number", "Account Number", "Starting Check Number"]
+DEFAULT_MAP = pd.DataFrame([
+    {"Property": "Example Property A", "Company": "Example Development LLC", "Bank Name": "Example Bank", "Routing Number": "000000000", "Account Number": "0001234567", "Starting Check Number": 1001},
+    {"Property": "Example Property B", "Company": "Example Housing LLC", "Bank Name": "Example Bank", "Routing Number": "000000000", "Account Number": "0009876543", "Starting Check Number": 2001},
+])
 if "property_map" not in st.session_state:
-    st.session_state.property_map = pd.DataFrame([
-        {
-            "Property": "1438 W 37th Dr",
-            "Company": "1438 Development LLC",
-            "Bank Name": "Test Bank",
-            "Routing Number": "000000000",
-            "Account Number": "TEST-ACCOUNT-001",
-            "Starting Check Number": 1001,
-        },
-        {
-            "Property": "1252 W 37th St",
-            "Company": "1252 Development LLC",
-            "Bank Name": "Test Bank",
-            "Routing Number": "000000000",
-            "Account Number": "TEST-ACCOUNT-002",
-            "Starting Check Number": 2001,
-        },
-    ])
-if "confirmed_batch" not in st.session_state:
-    st.session_state.confirmed_batch = None
+    st.session_state.property_map = DEFAULT_MAP.copy()
 
-# -----------------------------
-# Helpers
-# -----------------------------
-REQUIRED_COLUMNS = ["Payee", "Property", "Amount", "Check Date"]
-OPTIONAL_COLUMNS = ["Memo", "Reference"]
 
 def money(value):
     try:
@@ -95,328 +44,248 @@ def money(value):
             raise InvalidOperation
         d = d.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
         if d <= 0:
-            raise ValueError("Amount must be greater than zero.")
+            raise ValueError("Amount must be greater than zero")
         return d
-    except (InvalidOperation, ValueError, AttributeError):
+    except (InvalidOperation, ValueError, TypeError):
         raise ValueError(f"Invalid positive amount: {value!r}")
 
-def amount_words(amount: Decimal) -> str:
-    """Convert USD amount to words for display."""
-    ones = ["Zero", "One", "Two", "Three", "Four", "Five", "Six", "Seven",
-            "Eight", "Nine", "Ten", "Eleven", "Twelve", "Thirteen",
-            "Fourteen", "Fifteen", "Sixteen", "Seventeen", "Eighteen", "Nineteen"]
-    tens = ["", "", "Twenty", "Thirty", "Forty", "Fifty", "Sixty", "Seventy", "Eighty", "Ninety"]
 
-    def under_thousand(n):
+def amount_words(amount):
+    ones = ["Zero", "One", "Two", "Three", "Four", "Five", "Six", "Seven", "Eight", "Nine", "Ten", "Eleven", "Twelve", "Thirteen", "Fourteen", "Fifteen", "Sixteen", "Seventeen", "Eighteen", "Nineteen"]
+    tens = ["", "", "Twenty", "Thirty", "Forty", "Fifty", "Sixty", "Seventy", "Eighty", "Ninety"]
+    def under_1000(n):
         parts = []
         if n >= 100:
-            parts += [ones[n // 100], "Hundred"]
+            parts.extend([ones[n // 100], "Hundred"])
             n %= 100
         if n >= 20:
             parts.append(tens[n // 10])
             if n % 10:
                 parts.append(ones[n % 10])
-        elif n > 0:
+        elif n:
             parts.append(ones[n])
-        return " ".join(parts) if parts else "Zero"
-
-    def integer_words(n):
-        if n == 0:
-            return "Zero"
-        groups = [(1_000_000_000, "Billion"), (1_000_000, "Million"), (1000, "Thousand"), (1, "")]
-        parts = []
-        for value, label in groups:
-            group = n // value
-            if group:
-                parts.append(under_thousand(group) + (f" {label}" if label else ""))
-                n %= value
         return " ".join(parts)
+    n = int(amount)
+    if n == 0:
+        result = "Zero"
+    else:
+        chunks = []
+        for factor, label in [(10**9, "Billion"), (10**6, "Million"), (1000, "Thousand"), (1, "")]:
+            v, n = divmod(n, factor)
+            if v:
+                chunks.append(under_1000(v) + (" " + label if label else ""))
+        result = " ".join(chunks)
+    return f"{result} and {int((amount % 1) * 100):02d}/100 Dollars"
 
-    cents = int((amount * 100) % 100)
-    dollars = int(amount)
-    return f"{integer_words(dollars)} Dollars and {cents:02d}/100"
 
-def validate_upload(uploaded_file):
-    df = pd.read_excel(uploaded_file, dtype={"Payee": str, "Property": str})
+def validate_map(df):
+    df = df.copy()
     df.columns = [str(c).strip() for c in df.columns]
-
-    missing = [c for c in REQUIRED_COLUMNS if c not in df.columns]
+    missing = set(MAP_COLUMNS) - set(df.columns)
     if missing:
-        raise ValueError("Missing required columns: " + ", ".join(missing))
+        raise ValueError(f"Missing mapping columns: {', '.join(sorted(missing))}")
+    for col in MAP_COLUMNS[:-1]:
+        df[col] = df[col].fillna("").astype(str).str.strip()
+    if df.empty or df["Property"].eq("").any() or df["Property"].duplicated().any():
+        raise ValueError("Property must be nonempty and unique")
+    for _, item in df.iterrows():
+        if not re.fullmatch(r"\d{9}", item["Routing Number"]):
+            raise ValueError(f"{item['Property']}: Routing Number must be exactly 9 digits")
+        if not re.fullmatch(r"\d{1,20}", item["Account Number"]):
+            raise ValueError(f"{item['Property']}: Account Number must be 1–20 digits")
+        if not item["Company"] or not item["Bank Name"]:
+            raise ValueError(f"{item['Property']}: Company and Bank Name are required")
+    df["Starting Check Number"] = pd.to_numeric(df["Starting Check Number"], errors="raise").astype(int)
+    if (df["Starting Check Number"] < 1).any():
+        raise ValueError("Starting Check Number must be positive")
+    return df[MAP_COLUMNS]
 
+
+def validate_payments(df):
+    df = df.copy()
+    df.columns = [str(c).strip() for c in df.columns]
+    required = ["Payee", "Property", "Amount", "Check Date"]
+    missing = set(required) - set(df.columns)
+    if missing:
+        raise ValueError(f"Missing payment columns: {', '.join(sorted(missing))}")
     for col in ["Payee", "Property"]:
         df[col] = df[col].fillna("").astype(str).str.strip()
-
-    if "Memo" not in df.columns:
-        df["Memo"] = ""
-    if "Reference" not in df.columns:
-        df["Reference"] = ""
-
-    df["Memo"] = df["Memo"].fillna("").astype(str).str.strip()
-    df["Reference"] = df["Reference"].fillna("").astype(str).str.strip()
-
-    if (df["Payee"] == "").any():
-        raise ValueError("Payee cannot be blank.")
-    if (df["Property"] == "").any():
-        raise ValueError("Property cannot be blank.")
-
-    df["Amount"] = df["Amount"].apply(money)
-    df["Check Date"] = pd.to_datetime(df["Check Date"], errors="coerce")
-    if df["Check Date"].isna().any():
-        raise ValueError("One or more Check Date values are invalid.")
-    df["Check Date"] = df["Check Date"].dt.date
-
-    # Add a visible row number for troubleshooting
-    df.insert(0, "Excel Row", range(2, len(df) + 2))
+        if df[col].eq("").any():
+            raise ValueError(f"{col} cannot be blank")
+    df["Memo"] = df["Memo"].fillna("").astype(str) if "Memo" in df else ""
+    df["Amount"] = df["Amount"].map(money)
+    dates = pd.to_datetime(df["Check Date"], errors="coerce")
+    if dates.isna().any():
+        raise ValueError("Invalid Check Date")
+    df["Check Date"] = dates.dt.date
     return df
 
-def safe_text(value, max_len=70):
-    text = str(value or "")
-    return text if len(text) <= max_len else text[:max_len - 3] + "..."
 
-def draw_preview_check(c, row, check_number, account, preview_only=True):
-    # US Letter page; sample layout is for layout testing only.
+def micr_string(check_no, routing, account_no, transit="A", on_us="C"):
+    # Character mapping must be visually checked against the specific TTF glyphs.
+    # This is an unverified proof string, not bank-approved MICR encoding.
+    return f"{on_us}{check_no}{on_us}  {transit}{routing}{transit}  {account_no}{on_us}"
+
+
+def draw_check(c, payment, account, check_no, transit="A", on_us="C"):
     page_w, page_h = letter
-    x = 0.45 * inch
-    y = 4.25 * inch
-    w = 7.6 * inch
-    h = 3.0 * inch
-
-    c.setLineWidth(0.8)
-    c.rect(x, y, w, h)
-
-    # Bank/company header
-    c.setFont("Helvetica-Bold", 12)
-    c.drawString(x + 0.22 * inch, y + h - 0.38 * inch, safe_text(account["Company"], 55))
-    c.setFont("Helvetica", 8)
-    c.drawString(x + 0.22 * inch, y + h - 0.58 * inch, safe_text(account["Bank Name"], 55))
-    c.drawRightString(x + w - 0.22 * inch, y + h - 0.38 * inch, f"CHECK NO. {check_number}")
-    c.drawRightString(x + w - 0.22 * inch, y + h - 0.58 * inch, row["Check Date"].strftime("%m/%d/%Y"))
-
-    c.setFont("Helvetica", 9)
-    c.drawString(x + 0.22 * inch, y + h - 1.05 * inch, "PAY TO THE ORDER OF")
-    c.setFont("Helvetica-Bold", 11)
-    c.drawString(x + 1.45 * inch, y + h - 1.05 * inch, safe_text(row["Payee"], 52))
-    c.setFont("Helvetica-Bold", 11)
-    c.drawRightString(x + w - 0.22 * inch, y + h - 1.05 * inch, f"${row['Amount']:,.2f}")
-
-    c.setFont("Helvetica", 9)
-    c.drawString(x + 0.22 * inch, y + h - 1.48 * inch, safe_text(amount_words(row["Amount"]), 92))
-    c.line(x + 0.22 * inch, y + h - 1.56 * inch, x + w - 0.22 * inch, y + h - 1.56 * inch)
-
-    c.setFont("Helvetica", 8)
-    memo = safe_text(row.get("Memo", ""), 80)
-    c.drawString(x + 0.22 * inch, y + h - 1.92 * inch, f"Memo: {memo}")
-    c.drawString(x + 0.22 * inch, y + 0.58 * inch, "AUTHORIZED SIGNATURE: __________________________________")
-    c.drawRightString(x + w - 0.22 * inch, y + 0.58 * inch, "VOID IF NOT SIGNED")
-
-    c.setFont("MICR_E13B", 12)
+    x, y, w, h = .45*inch, 4.25*inch, 7.6*inch, 3.0*inch
+    c.setStrokeColorRGB(.35, .35, .35)
+    c.rect(x, y, w, h, stroke=1, fill=0)
     c.setFillColorRGB(0, 0, 0)
-    
-    micr_test = f"{check_number}  123456789  0001234567"
-    
-    c.drawString(
-        x + 0.35 * inch,
-        y + 0.22 * inch,
-        micr_test
-    )
-
-    if preview_only:
-        c.setFillGray(0.75)
-        c.setFont("Helvetica-Bold", 30)
-        c.saveState()
-        c.translate(page_w / 2, page_h / 2)
-        c.rotate(32)
-        c.drawCentredString(0, 0, "TEST PREVIEW — NOT NEGOTIABLE")
-        c.restoreState()
-        c.setFillGray(0)
+    c.setFont("Helvetica-Bold", 11)
+    c.drawString(x+.2*inch, y+h-.4*inch, str(account["Company"])[:52])
+    c.setFont("Helvetica", 8)
+    c.drawString(x+.2*inch, y+h-.61*inch, str(account["Bank Name"])[:64])
+    c.drawRightString(x+w-.2*inch, y+h-.4*inch, f"CHECK NO. {check_no}")
+    c.drawRightString(x+w-.2*inch, y+h-.61*inch, payment["Check Date"].strftime("%m/%d/%Y"))
+    c.setFont("Helvetica", 8)
+    c.drawString(x+.2*inch, y+h-1.06*inch, "PAY TO THE ORDER OF")
+    c.setFont("Helvetica-Bold", 10)
+    c.drawString(x+1.48*inch, y+h-1.06*inch, str(payment["Payee"])[:48])
+    c.drawRightString(x+w-.2*inch, y+h-1.06*inch, f"${payment['Amount']:,.2f}")
+    c.setFont("Helvetica", 8)
+    c.drawString(x+.2*inch, y+h-1.45*inch, amount_words(payment["Amount"])[:110])
+    c.line(x+.2*inch, y+h-1.53*inch, x+w-.2*inch, y+h-1.53*inch)
+    c.drawString(x+.2*inch, y+h-1.9*inch, "MEMO: " + str(payment.get("Memo", ""))[:75])
+    c.drawRightString(x+w-.2*inch, y+.68*inch, "AUTHORIZED SIGNATURE: __________________________")
+    line = micr_string(check_no, account["Routing Number"], account["Account Number"], transit, on_us)
+    if FONT_OK:
+        font_size = 12
+        width = pdfmetrics.stringWidth(line, "MICR_E13B", font_size)
+        if width > w-.6*inch:
+            font_size *= (w-.6*inch)/width
+        c.setFont("MICR_E13B", font_size)
+        c.drawString(x+.3*inch, y+.24*inch, line)
+    else:
+        c.setFont("Helvetica", 8)
+        c.drawString(x+.3*inch, y+.24*inch, "MICR FONT MISSING — NOT VALID")
+    c.saveState()
+    c.setFillColorRGB(.73, .73, .73)
+    c.setFont("Helvetica-Bold", 27)
+    c.translate(page_w/2, page_h/2)
+    c.rotate(30)
+    c.drawCentredString(0, 0, "TEST PREVIEW — NOT NEGOTIABLE")
+    c.restoreState()
     c.showPage()
 
-def build_pdf(df, property_map, start_override, preview_only=True):
-    mapping = property_map.set_index("Property").to_dict("index")
-    output = io.BytesIO()
-    c = canvas.Canvas(output, pagesize=letter)
-    c.setTitle("Check Management Test PDF")
 
-    for i, (_, row) in enumerate(df.iterrows()):
-        account = mapping[row["Property"]]
-        check_number = int(start_override) + i
-        draw_preview_check(c, row, check_number, account, preview_only=preview_only)
-
+def make_pdf(payments, mapping, transit="A", on_us="C"):
+    mapping_by_property = mapping.set_index("Property").to_dict("index")
+    counters = {prop: int(record["Starting Check Number"]) for prop, record in mapping_by_property.items()}
+    out = io.BytesIO()
+    c = canvas.Canvas(out, pagesize=letter)
+    c.setTitle("MICR Layout Test - Not Negotiable")
+    numbers = []
+    for _, row in payments.iterrows():
+        prop = row["Property"]
+        if prop not in mapping_by_property:
+            raise ValueError(f"Unmapped property: {prop}")
+        number = counters[prop]
+        counters[prop] += 1
+        numbers.append(number)
+        draw_check(c, row, mapping_by_property[prop], number, transit, on_us)
     c.save()
-    output.seek(0)
-    return output.getvalue()
+    return out.getvalue(), numbers
 
-# -----------------------------
-# Sidebar configuration
-# -----------------------------
-st.sidebar.header("1. Property & Bank Mapping")
-st.sidebar.caption("Use fictional/test details for this prototype.")
+
+st.sidebar.header("Property & Bank Mapping")
+st.sidebar.caption("Edit account details here. Bank numbers are text to preserve leading zeros.")
+map_upload = st.sidebar.file_uploader("Import mapping CSV", type="csv", key="map_upload")
+if map_upload is not None:
+    token = (map_upload.name, map_upload.size)
+    if st.session_state.get("last_map_upload") != token:
+        try:
+            st.session_state.property_map = validate_map(pd.read_csv(map_upload, dtype=str))
+            st.session_state.last_map_upload = token
+            st.sidebar.success("Mapping imported")
+        except Exception as exc:
+            st.sidebar.error(str(exc))
+
 edited_map = st.sidebar.data_editor(
     st.session_state.property_map,
     num_rows="dynamic",
     use_container_width=True,
-    key="property_mapping_editor",
+    key="property_editor",
     column_config={
-        "Starting Check Number": st.column_config.NumberColumn(
-            min_value=1, step=1, format="%d"
-        ),
-        "Routing Number": st.column_config.TextColumn(),
-        "Account Number": st.column_config.TextColumn(),
+        "Routing Number": st.column_config.TextColumn("Routing Number"),
+        "Account Number": st.column_config.TextColumn("Account Number"),
+        "Starting Check Number": st.column_config.NumberColumn("Starting Check Number", min_value=1, step=1),
     },
 )
 st.session_state.property_map = edited_map
+st.sidebar.download_button("Export mapping CSV (sensitive)", data=edited_map.to_csv(index=False).encode(), file_name="property_bank_mapping.csv", mime="text/csv")
+st.sidebar.caption("Mapping is kept in session state only; export to retain it. Protect the exported file.")
 
-st.sidebar.header("2. Check Number")
-start_number = st.sidebar.number_input(
-    "Starting check number for this test PDF",
-    min_value=1,
-    max_value=999999999,
-    value=1001,
-    step=1,
-)
-st.sidebar.warning(
-    "Prototype only: the starting number is manually entered and is not reserved in a database."
-)
+try:
+    mapping = validate_map(edited_map)
+except Exception as exc:
+    st.error(f"Please fix Property & Bank Mapping: {exc}")
+    st.stop()
 
-# -----------------------------
-# Upload and validate
-# -----------------------------
-st.header("Upload payment file")
-st.write("Required columns: `Payee`, `Property`, `Amount`, `Check Date`. Optional: `Memo`, `Reference`.")
+with st.expander("MICR font and symbol proof", expanded=False):
+    st.write("Font loaded:", FONT_OK)
+    st.write("The letters A/B/C/D may be mapped to special MICR symbols by your font. Confirm visually before relying on any mapping.")
+    transit = st.selectbox("Transit glyph character (test)", ["A", "B", "C", "D"], index=0)
+    on_us = st.selectbox("On-Us glyph character (test)", ["A", "B", "C", "D"], index=2)
+    st.code(f"{on_us}2000{on_us}  {transit}123456789{transit}  0012345678{on_us}")
 
-sample = pd.DataFrame([
-    {"Payee": "ABC Framing Inc.", "Property": "1438 W 37th Dr", "Amount": 2850.00, "Check Date": date.today(), "Memo": "Framing labor", "Reference": "TEST-001"},
-    {"Payee": "John Smith", "Property": "1438 W 37th Dr", "Amount": 950.00, "Check Date": date.today(), "Memo": "Weekly labor", "Reference": "TEST-002"},
-])
-sample_buffer = io.BytesIO()
-with pd.ExcelWriter(sample_buffer, engine="openpyxl") as writer:
-    sample.to_excel(writer, index=False, sheet_name="Payments")
-sample_buffer.seek(0)
-st.download_button(
-    "Download sample Excel template",
-    data=sample_buffer.getvalue(),
-    file_name="check_upload_template.xlsx",
-    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-)
-
-uploaded = st.file_uploader("Upload .xlsx file", type=["xlsx"])
-
-if uploaded:
-    try:
-        df = validate_upload(uploaded)
-        st.success(f"Imported {len(df)} payment row(s).")
-        st.subheader("Imported payments")
-        display_df = df.copy()
-        display_df["Amount"] = display_df["Amount"].map(lambda x: f"${x:,.2f}")
-        st.dataframe(display_df, use_container_width=True, hide_index=True)
-
-        mapping_df = st.session_state.property_map.copy()
-        if mapping_df.empty or "Property" not in mapping_df.columns:
-            st.error("Property mapping table is empty or invalid.")
-            st.stop()
-
-        mapping_df["Property"] = mapping_df["Property"].fillna("").astype(str).str.strip()
-        if mapping_df["Property"].duplicated().any():
-            st.error("Property mapping has duplicate Property names. Please fix them in the sidebar.")
-            st.stop()
-
-        map_records = mapping_df.set_index("Property").to_dict("index")
-        missing_properties = sorted(set(df["Property"]) - set(map_records.keys()))
-        if missing_properties:
-            st.error("These Properties are not mapped: " + ", ".join(missing_properties))
-            st.stop()
-
-        problems = []
-        for prop in sorted(set(df["Property"])):
-            acct = map_records[prop]
-            for field in ["Company", "Bank Name", "Routing Number", "Account Number"]:
-                val = str(acct.get(field, "") or "").strip()
-                if not val:
-                    problems.append(f"{prop}: missing {field}")
-            routing = str(acct.get("Routing Number", "") or "").strip()
-            if routing and (not routing.isdigit() or len(routing) != 9):
-                problems.append(f"{prop}: Routing Number should be 9 digits")
-        if problems:
-            st.error("Please fix mapping issues:\n\n- " + "\n- ".join(problems))
-            st.stop()
-
-        # Show matched company/account summary with masked account number
-        st.subheader("Matched company and bank account")
-        summary_rows = []
-        for prop in sorted(set(df["Property"])):
-            acct = map_records[prop]
-            account = str(acct["Account Number"])
-            masked = ("*" * max(0, len(account) - 4)) + account[-4:]
-            summary_rows.append({
-                "Property": prop,
-                "Company": acct["Company"],
-                "Bank": acct["Bank Name"],
-                "Routing Number": acct["Routing Number"],
-                "Account (masked)": masked,
-            })
-        st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, hide_index=True)
-
-        st.subheader("Review individual checks")
-        selected_row = st.selectbox(
-            "Select a payment to inspect",
-            options=list(range(len(df))),
-            format_func=lambda i: f"{i + 1}. {df.iloc[i]['Payee']} — ${df.iloc[i]['Amount']:,.2f}",
-        )
-        row = df.iloc[selected_row]
-        acct = map_records[row["Property"]]
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Payee", safe_text(row["Payee"], 40))
-        c2.metric("Amount", f"${row['Amount']:,.2f}")
-        c3.metric("Check Number (test)", str(int(start_number) + selected_row))
-        st.write(f"**Property:** {row['Property']}  |  **Company:** {acct['Company']}")
-        st.write(f"**Bank:** {acct['Bank Name']}  |  **Date:** {row['Check Date']}")
-        st.write(f"**Amount in words:** {amount_words(row['Amount'])}")
-        st.write(f"**Memo:** {row['Memo'] or '—'}")
-
-        total = sum(df["Amount"], Decimal("0.00"))
-        a, b, ccol = st.columns(3)
-        a.metric("Number of checks", len(df))
-        b.metric("Batch total", f"${total:,.2f}")
-        ccol.metric("Properties", df["Property"].nunique())
-
-        st.info(
-            "The PDF produced by this prototype is watermarked and includes a MICR placeholder. "
-            "It is for layout review only and is not suitable for payment."
-        )
-
-        confirm = st.checkbox(
-            "I reviewed the payees, properties, amounts, dates, and company/account mapping. "
-            "I understand this prototype PDF is not a valid payment instrument."
-        )
-
-        if st.button("Generate test PDF", type="primary", disabled=not confirm):
-            pdf = build_pdf(df, mapping_df, int(start_number), preview_only=True)
-            st.session_state["generated_pdf"] = pdf
-            st.session_state["generated_filename"] = "check_test_preview.pdf"
-            st.session_state["generated_count"] = len(df)
-            st.success("Test PDF generated. No check numbers were reserved and no payment was made.")
-
-        if st.session_state.get("generated_pdf"):
-            st.download_button(
-                "Download test PDF",
-                data=st.session_state["generated_pdf"],
-                file_name=st.session_state.get("generated_filename", "check_test_preview.pdf"),
-                mime="application/pdf",
-            )
-
-    except Exception as exc:
-        st.error(f"Could not process file: {exc}")
-
+mode = st.radio("Mode", ["Single Check", "Bulk Checks (Excel)"], horizontal=True)
+if mode == "Single Check":
+    prop = st.selectbox("Property", mapping["Property"].tolist())
+    acct = mapping.set_index("Property").loc[prop]
+    st.write(f"**Company:** {acct['Company']} | **Bank:** {acct['Bank Name']}")
+    st.caption(f"Routing: *****{acct['Routing Number'][-4:]} | Account: ****{acct['Account Number'][-4:]}")
+    with st.form("single_check"):
+        payee = st.text_input("Payee")
+        amount = st.text_input("Amount", "100.00")
+        check_date = st.date_input("Check Date", value=date.today())
+        memo = st.text_input("Memo")
+        check_no = st.number_input("Check Number (test)", min_value=1, step=1, value=int(acct["Starting Check Number"]))
+        confirmed = st.checkbox("I understand this is a watermarked layout proof, not a payable check")
+        submit = st.form_submit_button("Generate test PDF")
+    if submit:
+        try:
+            if not confirmed:
+                raise ValueError("Please confirm the test-only acknowledgement")
+            if not payee.strip():
+                raise ValueError("Payee is required")
+            row = {"Payee": payee.strip(), "Property": prop, "Amount": money(amount), "Check Date": check_date, "Memo": memo}
+            local_map = mapping.copy()
+            local_map.loc[local_map["Property"] == prop, "Starting Check Number"] = int(check_no)
+            pdf, numbers = make_pdf(pd.DataFrame([row]), local_map, transit, on_us)
+            st.session_state.single_pdf = pdf
+            st.session_state.single_filename = f"check_test_{numbers[0]}.pdf"
+            st.success("Test PDF generated; no check number was reserved")
+        except Exception as exc:
+            st.error(str(exc))
+    if st.session_state.get("single_pdf"):
+        st.download_button("Download single check test PDF", st.session_state.single_pdf, st.session_state.single_filename, mime="application/pdf")
 else:
-    st.info("Upload an Excel file or download the sample template to get started.")
+    st.write("Excel columns: **Payee, Property, Amount, Check Date**; optional **Memo**.")
+    example = pd.DataFrame([{"Payee": "Example Vendor", "Property": mapping.iloc[0]["Property"], "Amount": 250.00, "Check Date": date.today(), "Memo": "Test"}])
+    sample = io.BytesIO()
+    with pd.ExcelWriter(sample, engine="openpyxl") as writer:
+        example.to_excel(writer, index=False, sheet_name="Payments")
+    st.download_button("Download sample Excel", sample.getvalue(), "payment_template.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    upload = st.file_uploader("Upload payments Excel", type="xlsx")
+    if upload:
+        try:
+            payments = validate_payments(pd.read_excel(upload, dtype={"Payee": str, "Property": str, "Memo": str}))
+            unmapped = set(payments["Property"]) - set(mapping["Property"])
+            if unmapped:
+                raise ValueError("Unmapped properties: " + ", ".join(sorted(unmapped)))
+            st.dataframe(payments, hide_index=True, use_container_width=True)
+            st.write(f"**{len(payments)} checks** • Total ${sum(payments['Amount'], Decimal('0.00')):,.2f}")
+            confirmed = st.checkbox("I reviewed all payments and understand the PDF is a test-only layout proof")
+            if st.button("Generate bulk test PDF", disabled=not confirmed):
+                pdf, numbers = make_pdf(payments, mapping, transit, on_us)
+                st.session_state.bulk_pdf = pdf
+                st.success(f"Generated {len(numbers)} test pages. No check numbers reserved.")
+        except Exception as exc:
+            st.error(str(exc))
+    if st.session_state.get("bulk_pdf"):
+        st.download_button("Download bulk test PDF", st.session_state.bulk_pdf, "bulk_checks_test.pdf", mime="application/pdf")
 
-with st.expander("Important limitations"):
-    st.markdown("""
-- This is a local prototype and does not connect to MySQL or QuickBooks.
-- The PDF is watermarked and contains a MICR placeholder, not a real MICR line.
-- It does not issue, clear, transmit, or verify payments.
-- Do not enter real bank account numbers in a shared or unprotected test environment.
-- Before issuing checks, confirm your bank's check-stock, MICR font, magnetic toner, layout, and testing requirements.
-- The prototype does not implement authentication, approval workflows, persistent audit logs, transactional check-number reservation, or secure secrets management.
-""")
+st.divider()
+st.caption("This app does not persist check issuance history or provide bank-approved MICR output. Test with fictional data first; use bank-approved stock, equipment and verification for actual checks.")
