@@ -52,9 +52,62 @@ def generate_check(data, accept_terms=False):
         context = browser.new_context(accept_downloads=True, viewport={"width":1280,"height":1000})
         page = context.new_page()
         try:
-            page.goto(URL, wait_until="domcontentloaded", timeout=45000)
-            for field in ("company","address","bank","routing","account","check_number","date","payee","amount","memo"):
-                _fill(page,cfg,field,data.get(field,""),required=field not in ("address","memo","bank"))
+            page.goto(
+                URL,
+                wait_until="domcontentloaded",
+                timeout=60000
+            )
+            
+            page.wait_for_timeout(3000)
+            
+            print("=== FreeCheckPrint Debug ===")
+            print("Current URL:", page.url)
+            print("Page Title:", page.title())
+            
+            # 检查页面是否有 iframe
+            print("Frames:", [frame.url for frame in page.frames])
+            
+            # 读取输入框结构，不读取银行账号等实际填写内容
+            fields = page.locator("input, textarea").evaluate_all("""
+                elements => elements.map(el => ({
+                    tag: el.tagName,
+                    name: el.name,
+                    id: el.id,
+                    placeholder: el.placeholder,
+                    type: el.type,
+                    outerHTML: el.outerHTML.slice(0, 300)
+                }))
+            """)
+            
+            print("Website Fields:")
+            print(json.dumps(fields, indent=2, ensure_ascii=False))
+            
+            # 保存截图，方便进一步排查
+            page.screenshot(
+                path="/tmp/fcp_debug.png",
+                full_page=True
+            )
+            
+            # 原来的填写逻辑
+            for field in (
+                "company",
+                "address",
+                "bank",
+                "routing",
+                "account",
+                "check_number",
+                "date",
+                "payee",
+                "amount",
+                "memo"
+            ):
+                _fill(
+                    page,
+                    cfg,
+                    field,
+                    data.get(field, ""),
+                    required=field not in ("address", "memo", "bank")
+                )
             # Check Stock only: never silently fall back to Plain Paper.
             stock = _find(page,cfg["check_stock"] )
             if stock is None:
