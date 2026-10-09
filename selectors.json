@@ -7,7 +7,7 @@
       "textarea[name*=\"company\" i]",
       "input[placeholder*=\"company\" i]",
       "input[aria-label*=\"company\" i]"
-    ]
+    ],
     "address": [
       "textarea[name=\"address\"]",
       "input[name=\"address\"]",
