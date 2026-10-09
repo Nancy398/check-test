@@ -5,6 +5,4 @@ pandas
 gspread
 google-auth
 PyPDF2
-
-playwright
-chromium
+reportlab
