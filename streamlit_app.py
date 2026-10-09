@@ -28,10 +28,10 @@ if FONT_PATH.is_file():
 else:
     st.warning("micr-e13b.ttf not found next to streamlit_app.py. PDF will show a MICR placeholder.")
 
-MAP_COLUMNS = ["Property", "Company", "Company Address", "Bank Name", "Bank Address", "Routing Number", "Account Number", "Starting Check Number"]
+MAP_COLUMNS = ["Property", "Company", "Company Address", "Bank Name", "Routing Number", "Account Number", "Starting Check Number"]
 DEFAULT_MAP = pd.DataFrame([
-    {"Property": "Example Property A", "Company": "Example Development LLC", "Company Address": "123 Example St, Suite 100\nLos Angeles, CA 90000", "Bank Name": "Example Bank", "Bank Address": "", "Routing Number": "000000000", "Account Number": "0001234567", "Starting Check Number": 1001},
-    {"Property": "Example Property B", "Company": "Example Housing LLC", "Company Address": "456 Sample Ave\nLos Angeles, CA 90000", "Bank Name": "Example Bank", "Bank Address": "", "Routing Number": "000000000", "Account Number": "0009876543", "Starting Check Number": 2001},
+    {"Property": "Example Property A", "Company": "Example Development LLC", "Company Address": "123 Example St, Suite 100\nLos Angeles, CA 90000", "Bank Name": "Example Bank", "Routing Number": "000000000", "Account Number": "0001234567", "Starting Check Number": 1001},
+    {"Property": "Example Property B", "Company": "Example Housing LLC", "Company Address": "456 Sample Ave\nLos Angeles, CA 90000", "Bank Name": "Example Bank", "Routing Number": "000000000", "Account Number": "0009876543", "Starting Check Number": 2001},
 ])
 if "property_map" not in st.session_state:
     st.session_state.property_map = DEFAULT_MAP.copy()
@@ -81,7 +81,7 @@ def amount_words(amount):
 def validate_map(df):
     df = df.copy()
     df.columns = [str(c).strip() for c in df.columns]
-    for optional in ("Company Address", "Bank Address"):
+    for optional in ("Company Address",):
         if optional not in df.columns:
             df[optional] = ""
     missing = set(MAP_COLUMNS) - set(df.columns)
@@ -155,7 +155,6 @@ def draw_check(c, payment, account, check_no, transit="A", on_us="C"):
     company = str(account["Company"])
     bank = str(account["Bank Name"])
     address = address_lines(account.get("Company Address", ""))
-    bank_address = address_lines(account.get("Bank Address", ""))
     date_text = payment["Check Date"].strftime("%m/%d/%Y")
     payee = str(payment["Payee"])
     amount = payment["Amount"]
@@ -166,10 +165,8 @@ def draw_check(c, payment, account, check_no, transit="A", on_us="C"):
     # Header positions and typography closely follow the uploaded 2001 sample.
     txt(144, 40, company, "Helvetica-Bold", 9.2, "center", 210)
     for i, line in enumerate(address):
-        txt(144, 53 + i*10, line, size=7.7, align="center", max_width=240)
+        txt(144, 54 + i*10, line, size=7.7, align="center", max_width=240)
     txt(370, 35, bank, "Helvetica-Bold", 7.4, "center", 188)
-    for i, line in enumerate(bank_address[:2]):
-        txt(370, 46+i*9, line, size=6.6, align="center", max_width=190)
     txt(598, 39, check_no, "Courier", 11, "right")
     txt(555, 73, date_text, "Helvetica", 10, "right")
 
@@ -229,6 +226,10 @@ def draw_check(c, payment, account, check_no, transit="A", on_us="C"):
     # Coordinates in miniature's local space, y goes up.
     c.setFont("Helvetica-Bold", 8)
     c.drawString(0, 0, company[:42])
+    c.setFont("Helvetica", 7)
+    for i, line in enumerate(address[:2]):
+        c.drawString(0, -12 - i*10, line[:50])
+    c.setFont("Helvetica-Bold", 8)
     c.drawString(290, 0, bank[:37])
     c.drawRightString(820, 0, str(check_no))
     c.setFont("Helvetica", 8)
@@ -267,7 +268,7 @@ def make_pdf(payments, mapping, transit="A", on_us="C"):
 
 
 st.sidebar.header("Property & Bank Mapping")
-st.sidebar.caption("Edit company/bank names, Company Address, optional Bank Address and account details. For multi-line addresses, use a literal backslash-n separator between lines. Bank numbers are text to preserve leading zeros.")
+st.sidebar.caption("Enter the COMPANY address under Company Address. It prints immediately below the company name (top left); Bank Name prints separately at the top center. For multi-line addresses, use a literal backslash-n separator between lines. Bank numbers are text to preserve leading zeros.")
 map_upload = st.sidebar.file_uploader("Import mapping CSV", type="csv", key="map_upload")
 if map_upload is not None:
     token = (map_upload.name, map_upload.size)
@@ -288,12 +289,11 @@ edited_map = st.sidebar.data_editor(
         "Routing Number": st.column_config.TextColumn("Routing Number"),
         "Account Number": st.column_config.TextColumn("Account Number"),
         "Company Address": st.column_config.TextColumn("Company Address"),
-        "Bank Address": st.column_config.TextColumn("Bank Address (optional)"),
         "Starting Check Number": st.column_config.NumberColumn("Starting Check Number", min_value=1, step=1),
     },
 )
-st.session_state.property_map = edited_map
-st.sidebar.download_button("Export mapping CSV (sensitive)", data=edited_map.to_csv(index=False).encode(), file_name="property_bank_mapping.csv", mime="text/csv")
+st.session_state.property_map = edited_map.drop(columns=["Bank Address"], errors="ignore")
+st.sidebar.download_button("Export mapping CSV (sensitive)", data=st.session_state.property_map.to_csv(index=False).encode(), file_name="property_bank_mapping.csv", mime="text/csv")
 st.sidebar.caption("Mapping is kept in session state only; export to retain it. Protect the exported file.")
 
 try:
