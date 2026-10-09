@@ -180,7 +180,7 @@ def draw_check(c, payment, account, check_no, transit="A", on_us="C"):
     txt(36, 128, words + "*"*15, "Helvetica", 9.2, max_width=465)
     txt(602, 128, "DOLLARS", "Helvetica-Bold", 7, "right")
     txt(602, 148, "VOID 90 DAYS AFTER ISSUE", "Helvetica-Bold", 6.5, "right")
-    txt(72, 171, payee, "Helvetica", 9.5, max_width=280)
+    # Removed redundant payee name in the middle of the check.
     c.setLineWidth(.6)
     c.line(350, H-204, 600, H-204)
     txt(492, 216, "AUTHORIZED SIGNATURE", "Helvetica", 5.5, "center")
