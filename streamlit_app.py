@@ -13,6 +13,23 @@ from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 from pathlib import Path
 
+from fontTools.ttLib import TTFont as FontToolsTTFont
+from pathlib import Path
+
+font_path = Path(__file__).resolve().parent / "micr-e13b.ttf"
+
+font = FontToolsTTFont(str(font_path))
+cmap = font.getBestCmap() or {}
+
+st.write("MICR special character mapping:")
+
+for char in ["A", "B", "C", "D", "⑆", "⑇", "⑈", "⑉"]:
+    st.write(
+        repr(char),
+        "→",
+        cmap.get(ord(char), "NOT SUPPORTED")
+    )
+
 MICR_FONT_PATH = Path(__file__).resolve().parent / "micr-e13b.ttf"
 
 if MICR_FONT_PATH.exists():
