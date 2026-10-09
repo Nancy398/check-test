@@ -1,10 +1,13 @@
 {
   "fields": {
-    "Maker(your company) Name": [
+    "company": [
       "input[name=\"companyName\"]",
       "input[name=\"company\"]",
-      "input[placeholder*=\"Company\" i]"
-    ],
+      "input[id*=\"company\" i]",
+      "textarea[name*=\"company\" i]",
+      "input[placeholder*=\"company\" i]",
+      "input[aria-label*=\"company\" i]"
+    ]
     "address": [
       "textarea[name=\"address\"]",
       "input[name=\"address\"]",
