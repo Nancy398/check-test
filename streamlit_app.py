@@ -13,23 +13,34 @@ from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 from pathlib import Path
 
-from fontTools.ttLib import TTFont as FontToolsTTFont
-from pathlib import Path
+import io
+import streamlit as st
+from reportlab.pdfgen import canvas
 
-font_path = Path(__file__).resolve().parent / "micr-e13b.ttf"
+def micr_font_test():
+    buffer = io.BytesIO()
+    c = canvas.Canvas(buffer)
 
-font = FontToolsTTFont(str(font_path))
-cmap = font.getBestCmap() or {}
+    c.setFont("Helvetica", 12)
+    c.drawString(60, 750, "MICR E-13B Character Test")
 
-st.write("MICR special character mapping:")
+    c.setFont("MICR_E13B", 24)
+    c.drawString(60, 690, "0123456789")
+    c.drawString(60, 630, "A B C D")
+    c.drawString(60, 570, "A123456789A")
+    c.drawString(60, 510, "B123456789B")
+    c.drawString(60, 450, "C123456789C")
+    c.drawString(60, 390, "D123456789D")
 
-for char in ["A", "B", "C", "D", "⑆", "⑇", "⑈", "⑉"]:
-    st.write(
-        repr(char),
-        "→",
-        cmap.get(ord(char), "NOT SUPPORTED")
-    )
+    c.save()
+    return buffer.getvalue()
 
+st.download_button(
+    "Download MICR Font Test",
+    data=micr_font_test(),
+    file_name="micr_font_test.pdf",
+    mime="application/pdf"
+)
 MICR_FONT_PATH = Path(__file__).resolve().parent / "micr-e13b.ttf"
 
 if MICR_FONT_PATH.exists():
