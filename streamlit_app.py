@@ -272,8 +272,8 @@ def draw_check(c, payment, account, check_no, transit="A", on_us="C"):
     c.setLineWidth(.6)
     c.line(350, H-204, 600, H-204)
     txt(492, 216, "AUTHORIZED SIGNATURE", "Helvetica", 5.5, "center")
-    txt(13, 221, "MEMO", "Helvetica-Bold", 7)
-    txt(46, 221, memo, "Helvetica", 7.2, max_width=290)
+    txt(13, 221, "MEMO", "Helvetica-Bold", 9)
+    txt(46, 221, memo, "Helvetica", 10, max_width=290)
 
     # MICR line: mapping and alignment must be validated by the bank/printer.
     line = micr_string(check_no, account["Routing Number"], account["Account Number"], transit, on_us)
