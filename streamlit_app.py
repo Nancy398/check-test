@@ -31,7 +31,7 @@ if FONT_PATH.is_file():
 else:
     st.warning("micr-e13b.ttf not found next to streamlit_app.py. PDF will show a MICR placeholder.")
 
-DEFAULT_COMPANY_ADDRESS = "3250 Wilshire Blvd, STE1502, Los Angeles, CA 90010"
+DEFAULT_COMPANY_ADDRESS = "3250 Wilshire Blvd, STE1502\nLos Angeles, CA 90010"
 MAP_COLUMNS = ["Property", "Company", "Company Address", "Bank Name", "Routing Number", "Account Number", "Starting Check Number"]
 DEFAULT_MAP = pd.DataFrame([
     {"Property": "Example Property A", "Company": "Example Development LLC", "Company Address": DEFAULT_COMPANY_ADDRESS, "Bank Name": "Example Bank", "Routing Number": "000000000", "Account Number": "0001234567", "Starting Check Number": 1001},
