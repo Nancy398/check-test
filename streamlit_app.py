@@ -1,5 +1,8 @@
 """Plain white, logo-free check layout proof with single and bulk modes."""
 import io
+import json
+import gspread
+from google.oauth2.service_account import Credentials
 import re
 from datetime import date
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
@@ -28,13 +31,66 @@ if FONT_PATH.is_file():
 else:
     st.warning("micr-e13b.ttf not found next to streamlit_app.py. PDF will show a MICR placeholder.")
 
+DEFAULT_COMPANY_ADDRESS = "3250 Wilshire Blvd, STE1502, Los Angeles, CA 90010"
 MAP_COLUMNS = ["Property", "Company", "Company Address", "Bank Name", "Routing Number", "Account Number", "Starting Check Number"]
 DEFAULT_MAP = pd.DataFrame([
-    {"Property": "Example Property A", "Company": "Example Development LLC", "Company Address": "123 Example St, Suite 100\nLos Angeles, CA 90000", "Bank Name": "Example Bank", "Routing Number": "000000000", "Account Number": "0001234567", "Starting Check Number": 1001},
-    {"Property": "Example Property B", "Company": "Example Housing LLC", "Company Address": "456 Sample Ave\nLos Angeles, CA 90000", "Bank Name": "Example Bank", "Routing Number": "000000000", "Account Number": "0009876543", "Starting Check Number": 2001},
+    {"Property": "Example Property A", "Company": "Example Development LLC", "Company Address": DEFAULT_COMPANY_ADDRESS, "Bank Name": "Example Bank", "Routing Number": "000000000", "Account Number": "0001234567", "Starting Check Number": 1001},
+    {"Property": "Example Property B", "Company": "Example Housing LLC", "Company Address": DEFAULT_COMPANY_ADDRESS, "Bank Name": "Example Bank", "Routing Number": "000000000", "Account Number": "0009876543", "Starting Check Number": 2001},
 ])
 if "property_map" not in st.session_state:
     st.session_state.property_map = DEFAULT_MAP.copy()
+
+
+def _sheet_client():
+    """Read-only access to existing Google Sheets service account secrets."""
+    if "GOOGLE_APPLICATION_CREDENTIALS" not in st.secrets:
+        raise ValueError("Streamlit Secrets 缺少 GOOGLE_APPLICATION_CREDENTIALS")
+    raw = st.secrets["GOOGLE_APPLICATION_CREDENTIALS"]
+    if isinstance(raw, str):
+        info = json.loads(raw)
+    else:
+        info = dict(raw)
+    creds = Credentials.from_service_account_info(
+        info, scopes=["https://www.googleapis.com/auth/spreadsheets.readonly"]
+    )
+    return gspread.authorize(creds)
+
+
+def load_google_sheet_mapping(spreadsheet_name="Check Issuance History", worksheet_name="Project"):
+    """Convert the prior Project worksheet into this app's property mapping."""
+    worksheet = _sheet_client().open(spreadsheet_name).worksheet(worksheet_name)
+    records = worksheet.get_all_records(numericise_ignore=["all"])
+    result = []
+    for idx, record in enumerate(records, start=2):
+        r = {str(k).strip().lower().replace(" ", "_"): str(v).strip() for k, v in record.items()}
+        def pick(*names):
+            return next((r[n] for n in names if r.get(n)), "")
+        project = pick("project_name", "property", "project")
+        if not project:
+            continue
+        company = pick("company_name", "company")
+        bank = pick("bank_name", "bank")
+        routing = pick("routing_number", "routing")
+        account = pick("account_number", "bank_account_number")
+        # 'Account' in the prior sheet is an internal account ID (e.g. ACC-8652).
+        # Never mistake it for the actual bank account number.
+        start_text = pick("starting_check_number", "start_check_number") or "1001"
+        try:
+            start_no = int(start_text)
+        except ValueError:
+            raise ValueError(f"Project sheet 第 {idx} 行 Starting Check Number 无效")
+        result.append({
+            "Property": project,
+            "Company": company,
+            "Company Address": pick("company_address", "address") or DEFAULT_COMPANY_ADDRESS,
+            "Bank Name": bank,
+            "Routing Number": routing,
+            "Account Number": account,
+            "Starting Check Number": start_no,
+        })
+    if not result:
+        raise ValueError("Project worksheet 没有可用项目")
+    return validate_map(pd.DataFrame(result))
 
 
 def money(value):
@@ -83,7 +139,9 @@ def validate_map(df):
     df.columns = [str(c).strip() for c in df.columns]
     for optional in ("Company Address",):
         if optional not in df.columns:
-            df[optional] = ""
+            df[optional] = DEFAULT_COMPANY_ADDRESS
+        else:
+            df[optional] = df[optional].fillna("").astype(str).apply(lambda x: x if x.strip() else DEFAULT_COMPANY_ADDRESS)
     missing = set(MAP_COLUMNS) - set(df.columns)
     if missing:
         raise ValueError(f"Missing mapping columns: {', '.join(sorted(missing))}")
@@ -172,7 +230,7 @@ def draw_check(c, payment, account, check_no, transit="A", on_us="C"):
 
     txt(13, 99, "PAY TO THE", "Helvetica", 5.4)
     txt(13, 106, "ORDER OF", "Helvetica", 5.4)
-    txt(48, 105, payee, "Helvetica", 11, max_width=390)
+    txt(72, 105, payee, "Helvetica", 11, max_width=360)
     txt(476, 105, "$", "Helvetica-Bold", 11)
     txt(548, 105, f"****{amount_text}", "Helvetica", 10.5, "right", 90)
     txt(13, 128, "Pay", "Helvetica-Bold", 7.5)
@@ -267,8 +325,22 @@ def make_pdf(payments, mapping, transit="A", on_us="C"):
     return out.getvalue(), numbers
 
 
+st.sidebar.header("Google Sheets")
+st.sidebar.caption("可直接读取之前 Check Issuance History → Project 的项目、公司和银行信息。只读取，不会修改 Google Sheets。")
+spreadsheet_name = st.sidebar.text_input("Spreadsheet name", value="Check Issuance History")
+worksheet_name = st.sidebar.text_input("Project worksheet", value="Project")
+if st.sidebar.button("Load / Refresh from Google Sheets"):
+    try:
+        loaded = load_google_sheet_mapping(spreadsheet_name, worksheet_name)
+        st.session_state.property_map = loaded
+        # Force data_editor to initialize with freshly loaded rows.
+        st.session_state.map_editor_version = st.session_state.get("map_editor_version", 0) + 1
+        st.sidebar.success(f"Loaded {len(loaded)} properties")
+    except Exception as exc:
+        st.sidebar.error(f"Google Sheets 读取失败：{exc}")
+
 st.sidebar.header("Property & Bank Mapping")
-st.sidebar.caption("Enter the COMPANY address under Company Address. It prints immediately below the company name (top left); Bank Name prints separately at the top center. For multi-line addresses, use a literal backslash-n separator between lines. Bank numbers are text to preserve leading zeros.")
+st.sidebar.caption("Company Address 默认为 3250 Wilshire Blvd, STE1502, Los Angeles, CA 90010，显示在公司名称下面；可单独修改。Routing/Account 请在 Sheets 里设为纯文本以保留前导零。")
 map_upload = st.sidebar.file_uploader("Import mapping CSV", type="csv", key="map_upload")
 if map_upload is not None:
     token = (map_upload.name, map_upload.size)
@@ -284,7 +356,7 @@ edited_map = st.sidebar.data_editor(
     st.session_state.property_map,
     num_rows="dynamic",
     use_container_width=True,
-    key="property_editor",
+    key=f"property_editor_{st.session_state.get('map_editor_version', 0)}",
     column_config={
         "Routing Number": st.column_config.TextColumn("Routing Number"),
         "Account Number": st.column_config.TextColumn("Account Number"),
