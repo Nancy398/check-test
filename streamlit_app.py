@@ -41,56 +41,86 @@ if "property_map" not in st.session_state:
     st.session_state.property_map = DEFAULT_MAP.copy()
 
 
-def _sheet_client():
-    """Read-only access to existing Google Sheets service account secrets."""
-    if "GOOGLE_APPLICATION_CREDENTIALS" not in st.secrets:
-        raise ValueError("Streamlit Secrets 缺少 GOOGLE_APPLICATION_CREDENTIALS")
-    raw = st.secrets["GOOGLE_APPLICATION_CREDENTIALS"]
-    if isinstance(raw, str):
-        info = json.loads(raw)
-    else:
-        info = dict(raw)
-    creds = Credentials.from_service_account_info(
-        info, scopes=["https://www.googleapis.com/auth/spreadsheets.readonly"]
-    )
-    return gspread.authorize(creds)
+# Use the same authorization and reading pattern as the original Check Generator.
+GS_SPREADSHEET_NAME = "Check Issuance History"
+GS_WORKSHEET_NAME = "Sheet1"
 
 
-def load_google_sheet_mapping(spreadsheet_name="Check Issuance History", worksheet_name="Project"):
-    """Convert the prior Project worksheet into this app's property mapping."""
-    worksheet = _sheet_client().open(spreadsheet_name).worksheet(worksheet_name)
-    records = worksheet.get_all_records(numericise_ignore=["all"])
+def get_gc_client():
+    scope = [
+        "https://spreadsheets.google.com/feeds",
+        "https://www.googleapis.com/auth/drive",
+    ]
+    creds_dict = dict(st.secrets["GOOGLE_APPLICATION_CREDENTIALS"])
+    if "private_key" in creds_dict:
+        creds_dict["private_key"] = creds_dict["private_key"].replace("\\n", "\n")
+    credentials = Credentials.from_service_account_info(creds_dict, scopes=scope)
+    return gspread.authorize(credentials)
+
+
+def read_file(name, sheet):
+    """Original application's get_all_values method, preserving leading zeroes."""
+    gc = get_gc_client()
+    worksheet = gc.open(name).worksheet(sheet)
+    rows = worksheet.get_all_values()
+    if not rows or len(rows) <= 1:
+        return pd.DataFrame()
+    df = pd.DataFrame.from_records(rows)
+    df = pd.DataFrame(df.values[1:], columns=df.iloc[0])
+    df.columns = df.columns.str.strip()
+    return df
+
+
+def fetch_next_check_numbers_from_gs(project_names, default_start_number=1001):
+    """Use the original app's Sheet1/Project check numbering behavior."""
+    next_numbers = {name: default_start_number for name in project_names}
+    history = read_file(GS_SPREADSHEET_NAME, GS_WORKSHEET_NAME)
+    if history.empty or not {"Project", "Check Number"}.issubset(history.columns):
+        return next_numbers
+    history["Check Number"] = pd.to_numeric(history["Check Number"], errors="coerce")
+    maxima = history.groupby("Project")["Check Number"].max().to_dict()
+    for name in project_names:
+        if name in maxima and pd.notnull(maxima[name]):
+            next_numbers[name] = int(maxima[name]) + 1
+    return next_numbers
+
+
+def load_google_sheet_mapping(spreadsheet_name=GS_SPREADSHEET_NAME, worksheet_name="Project"):
+    """Read Project using the same service account and get_all_values as the original app."""
+    df = read_file(spreadsheet_name, worksheet_name)
+    if df.empty:
+        raise ValueError("Project worksheet 没有数据")
+    df.columns = [str(c).strip() for c in df.columns]
+    if "Project_Name" not in df.columns:
+        raise ValueError("Project worksheet 缺少 Project_Name 列")
+
     result = []
-    for idx, record in enumerate(records, start=2):
+    for idx, record in df.iterrows():
         r = {str(k).strip().lower().replace(" ", "_"): str(v).strip() for k, v in record.items()}
         def pick(*names):
             return next((r[n] for n in names if r.get(n)), "")
         project = pick("project_name", "property", "project")
         if not project:
             continue
-        company = pick("company_name", "company")
-        bank = pick("bank_name", "bank")
-        routing = pick("routing_number", "routing")
-        account = pick("account_number", "bank_account_number")
-        # 'Account' in the prior sheet is an internal account ID (e.g. ACC-8652).
-        # Never mistake it for the actual bank account number.
         start_text = pick("starting_check_number", "start_check_number") or "1001"
         try:
             start_no = int(start_text)
-        except ValueError:
-            raise ValueError(f"Project sheet 第 {idx} 行 Starting Check Number 无效")
+        except ValueError as exc:
+            raise ValueError(f"Project worksheet 第 {idx + 2} 行起始支票号无效") from exc
         result.append({
             "Property": project,
-            "Company": company,
+            "Company": pick("company_name", "company"),
             "Company Address": pick("company_address", "address") or DEFAULT_COMPANY_ADDRESS,
-            "Bank Name": bank,
-            "Routing Number": routing,
-            "Account Number": account,
+            "Bank Name": pick("bank_name", "bank"),
+            "Routing Number": pick("routing_number", "routing"),
+            "Account Number": pick("account_number", "bank_account_number"),
             "Starting Check Number": start_no,
         })
     if not result:
         raise ValueError("Project worksheet 没有可用项目")
-    return validate_map(pd.DataFrame(result))
+    # Don't reject the entire sheet during loading if bank fields are incomplete.
+    # The mapping editor below allows filling them in and validates before PDF creation.
+    return pd.DataFrame(result, columns=MAP_COLUMNS)
 
 
 def money(value):
@@ -326,18 +356,25 @@ def make_pdf(payments, mapping, transit="A", on_us="C"):
 
 
 st.sidebar.header("Google Sheets")
-st.sidebar.caption("可直接读取之前 Check Issuance History → Project 的项目、公司和银行信息。只读取，不会修改 Google Sheets。")
-spreadsheet_name = st.sidebar.text_input("Spreadsheet name", value="Check Issuance History")
+st.sidebar.caption("与原 Check Generator 相同的 Google Sheets 认证和读取方式；只读取，不写入历史。")
+spreadsheet_name = st.sidebar.text_input("Spreadsheet name", value=GS_SPREADSHEET_NAME)
 worksheet_name = st.sidebar.text_input("Project worksheet", value="Project")
 if st.sidebar.button("Load / Refresh from Google Sheets"):
     try:
         loaded = load_google_sheet_mapping(spreadsheet_name, worksheet_name)
+        # Read Sheet1 just like the previous app; failure here must not block Project loading.
+        try:
+            next_numbers = fetch_next_check_numbers_from_gs(loaded["Property"].tolist())
+            loaded["Starting Check Number"] = loaded["Property"].map(next_numbers).astype(int)
+            st.sidebar.info("Check Number defaults loaded from Sheet1 history")
+        except Exception as history_exc:
+            st.sidebar.warning(f"Project 已读取；Sheet1 历史编号读取失败：{history_exc}")
         st.session_state.property_map = loaded
-        # Force data_editor to initialize with freshly loaded rows.
         st.session_state.map_editor_version = st.session_state.get("map_editor_version", 0) + 1
         st.sidebar.success(f"Loaded {len(loaded)} properties")
     except Exception as exc:
-        st.sidebar.error(f"Google Sheets 读取失败：{exc}")
+        st.sidebar.error(f"Google Sheets 读取失败：{type(exc).__name__}: {exc}")
+        st.sidebar.caption("请确认 Secrets 中 GOOGLE_APPLICATION_CREDENTIALS 与旧版完全一致，且 Service Account 已获 Sheet 访问权限。")
 
 st.sidebar.header("Property & Bank Mapping")
 st.sidebar.caption("Company Address 默认为 3250 Wilshire Blvd, STE1502, Los Angeles, CA 90010，显示在公司名称下面；可单独修改。Routing/Account 请在 Sheets 里设为纯文本以保留前导零。")
