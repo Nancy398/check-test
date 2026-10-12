@@ -97,7 +97,7 @@ def get_or_create_company_folder(service, root_folder_id, company):
     query = (f"name = '{escaped_name}' and mimeType = 'application/vnd.google-apps.folder' "
              f"and '{root_folder_id}' in parents and trashed = false")
     result = service.files().list(
-        q=query, fields="nextPageToken,files(id,name)", page_size=100,
+        q=query, fields="nextPageToken,files(id,name)", pageSize=100,
         supportsAllDrives=True, includeItemsFromAllDrives=True,
     ).execute()
     folders = result.get("files", [])
