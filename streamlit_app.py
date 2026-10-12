@@ -417,6 +417,9 @@ def draw_check(c, payment, account, check_no, transit="A", on_us="C", signature_
     origin to match the supplied reference. This is a watermarked layout proof.
     """
     W, H = letter
+    # Move all printed check content upward by exactly 5 mm (14.17 PDF points).
+    c.saveState()
+    c.translate(0, 5 * 72 / 25.4)
     def txt(x, top, text, font="Helvetica", size=8, align="left", max_width=None):
         text = str(text or "")
         if max_width is not None:
@@ -468,8 +471,8 @@ def draw_check(c, payment, account, check_no, transit="A", on_us="C", signature_
             signature = ImageReader(io.BytesIO(signature_bytes))
             image_width, image_height = signature.getSize()
             # Fit within the signature area without stretching the image.
-            max_width, max_height = 205, 46
-            scale = min(max_width / image_width, max_height / image_height)
+            max_width, max_height = 125, 25
+            scale = min(1.0, max_width / image_width, max_height / image_height)
             drawn_width, drawn_height = image_width * scale, image_height * scale
             c.drawImage(
                 signature,
@@ -482,8 +485,8 @@ def draw_check(c, payment, account, check_no, transit="A", on_us="C", signature_
         except Exception as exc:
             raise ValueError(f"Unable to draw signature image: {exc}") from exc
     txt(492, 216, "AUTHORIZED SIGNATURE", "Helvetica", 5.5, "center")
-    txt(13, 211, "MEMO", "Helvetica-Bold", 9)
-    txt(46, 211, memo, "Helvetica", 10, max_width=290)
+    txt(13, 205, "MEMO", "Helvetica-Bold", 9)
+    txt(46, 205, memo, "Helvetica", 10, max_width=290)
 
     # MICR line: mapping and alignment must be validated by the bank/printer.
     line = micr_string(check_no, account["Routing Number"], account["Account Number"], transit, on_us)
@@ -535,6 +538,7 @@ def draw_check(c, payment, account, check_no, transit="A", on_us="C", signature_
     # No logo, colored background, or diagonal watermark.
     # A clear non-negotiable notice remains outside the check area.
     txt(306, 525, "LAYOUT TEST ONLY — NOT NEGOTIABLE", "Helvetica-Bold", 8, "center")
+    c.restoreState()
     c.showPage()
 
 
@@ -661,7 +665,7 @@ with st.sidebar.expander("Signature settings", expanded=False):
     if uploaded_signature is not None:
         default_signature_bytes = uploaded_signature.getvalue()
     if default_signature_bytes:
-        st.image(default_signature_bytes, caption="Shared signature preview", width=230)
+        st.image(default_signature_bytes, caption="Shared signature preview (original proportions)", width=115)
     else:
         st.caption("No default signature configured. Add CHECK_SIGNATURE_BASE64 in Secrets or a private signature.png file.")
     st.caption("Use only a signature you are authorized to apply. Restrict access to this app and archived PDFs.")
@@ -923,28 +927,45 @@ if mode == "📝 Single Mannul Check":
         """)
 
         def handle_sync_and_download():
-            record = [
-                {
-                    "Check Number": check_num,
-                    "Issue Date": pay_date.strftime("%Y-%m-%d"),
-                    "Company": company_display,
-                    "Account": account_num,
-                    "Project": project_site,
-                    "Stage": selected_stage_str,
-                    "Payee Name": payee_name,
-                    "Amount": pay_amount,
-                    "Memo": memo_text,
-                }
-            ]
-            if save_to_history(record):
-                st.session_state["sync_success_msg"] = f"🎉 Check #{check_num} Successfully saved & transferred to Google Sheets!"
+            """Archive the single-check PDF first, then save its Drive link to history."""
+            record = [{
+                "Check Number": int(check_num),
+                "Issue Date": pay_date.strftime("%Y-%m-%d"),
+                "Company": company_display,
+                "Account": account_num,
+                "Project": project_site,
+                "Stage": selected_stage_str,
+                "Payee Name": payee_name,
+                "Amount": pay_amount,
+                "Memo": memo_text,
+            }]
+            key = (company_display, account_num)
+            try:
+                # Use the same company-folder structure and naming convention as bulk checks.
+                pdf_urls = upload_merged_pdfs_to_drive(
+                    {key: filled_pdf}, pay_date, {key: [int(check_num)]}
+                )
+            except Exception as exc:
+                st.session_state["sync_error_msg"] = (
+                    f"Drive PDF upload failed: {exc}. The PDF was downloaded, "
+                    "but no Sheets history was saved to avoid an empty PDF Link."
+                )
+                return
+
+            if save_batch_with_pdf_links(record, pdf_urls):
+                st.session_state["sync_success_msg"] = (
+                    f"Check #{check_num} saved to Google Drive and Google Sheets with PDF Link!"
+                )
             else:
-                st.session_state["sync_error_msg"] = f"⚠ Check #{check_num} PDF downloaded, but failed to sync to Google Sheets."
+                st.session_state["sync_error_msg"] = (
+                    "PDF uploaded to Drive, but saving the Google Sheets history failed. "
+                    "Check Drive and Sheets before retrying to avoid duplicates."
+                )
 
         if pdf_error:
             st.error(pdf_error)
         st.download_button(
-            label=f"🚀 Save to Sheets & Download PDF (#{check_num})",
+            label=f"🚀 Save to Drive & Sheets + Download PDF (#{check_num})",
             data=filled_pdf or b"",
             disabled=filled_pdf is None,
             file_name=f"Check_{check_num}_{payee_name}.pdf",
