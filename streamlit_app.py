@@ -485,8 +485,8 @@ def draw_check(c, payment, account, check_no, transit="A", on_us="C", signature_
         except Exception as exc:
             raise ValueError(f"Unable to draw signature image: {exc}") from exc
     txt(492, 216, "AUTHORIZED SIGNATURE", "Helvetica", 5.5, "center")
-    txt(13, 205, "MEMO", "Helvetica-Bold", 9)
-    txt(46, 205, memo, "Helvetica", 10, max_width=290)
+    txt(13, 190, "MEMO", "Helvetica-Bold", 9)
+    txt(46, 190, memo, "Helvetica", 10, max_width=290)
 
     # MICR line: mapping and alignment must be validated by the bank/printer.
     line = micr_string(check_no, account["Routing Number"], account["Account Number"], transit, on_us)
