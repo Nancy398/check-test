@@ -14,6 +14,7 @@ from PyPDF2 import PdfMerger
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
+from reportlab.lib.utils import ImageReader
 
 # ----------------- 页面配置 -----------------
 st.set_page_config(
@@ -314,7 +315,28 @@ def ensure_bank(alias, project=""):
         raise ValueError(f"Account {alias}: Account Number must contain digits only")
     return bank
 
-def generate_check_pdf(company, account_alias, project, check_no, pay_date, payee, amount, memo, custom_bank=None):
+def load_default_signature():
+    """Read one shared signature, preferably from private Streamlit Secrets.
+
+    CHECK_SIGNATURE_BASE64 can contain a base64-encoded PNG/JPG. Alternatively,
+    place signature.png beside this script (keep it out of public repositories).
+    """
+    encoded = str(st.secrets.get("CHECK_SIGNATURE_BASE64", "")).strip()
+    if encoded:
+        try:
+            if "," in encoded and encoded.lower().startswith("data:image/"):
+                encoded = encoded.split(",", 1)[1]
+            return base64.b64decode(encoded, validate=True)
+        except Exception as exc:
+            st.sidebar.error(f"Invalid CHECK_SIGNATURE_BASE64: {exc}")
+            return None
+    local_file = Path(__file__).resolve().parent / "signature.png"
+    if local_file.is_file():
+        return local_file.read_bytes()
+    return None
+
+
+def generate_check_pdf(company, account_alias, project, check_no, pay_date, payee, amount, memo, custom_bank=None, signature_bytes=None):
     if custom_bank is not None:
         bank = dict(custom_bank)
         missing = [k for k in ("Bank Name", "Routing Number", "Account Number") if not str(bank.get(k, "")).strip()]
@@ -337,7 +359,7 @@ def generate_check_pdf(company, account_alias, project, check_no, pay_date, paye
     out = io.BytesIO()
     c = canvas.Canvas(out, pagesize=letter)
     c.setTitle("Check layout proof - not negotiable")
-    draw_check(c, payment, info, int(check_no))
+    draw_check(c, payment, info, int(check_no), signature_bytes=signature_bytes)
     c.save()
     return out.getvalue()
 
@@ -388,7 +410,7 @@ def micr_string(check_no, routing, account_no, transit="A", on_us="C"):
     return f"{on_us}{check_no}{on_us}  {transit}{routing}{transit}  {account_no}{on_us}"
 
 
-def draw_check(c, payment, account, check_no, transit="A", on_us="C"):
+def draw_check(c, payment, account, check_no, transit="A", on_us="C", signature_bytes=None):
     """FreeCheckPrint-inspired US Letter layout; all printed fields are generated anew.
 
     Top portion: check; lower portion: record stub. Coordinates use top-left
@@ -441,6 +463,24 @@ def draw_check(c, payment, account, check_no, transit="A", on_us="C"):
     # Removed redundant payee name in the middle of the check.
     c.setLineWidth(.6)
     c.line(350, H-204, 600, H-204)
+    if signature_bytes:
+        try:
+            signature = ImageReader(io.BytesIO(signature_bytes))
+            image_width, image_height = signature.getSize()
+            # Fit within the signature area without stretching the image.
+            max_width, max_height = 205, 46
+            scale = min(max_width / image_width, max_height / image_height)
+            drawn_width, drawn_height = image_width * scale, image_height * scale
+            c.drawImage(
+                signature,
+                475 - drawn_width / 2,
+                H - 201,
+                width=drawn_width,
+                height=drawn_height,
+                mask="auto",
+            )
+        except Exception as exc:
+            raise ValueError(f"Unable to draw signature image: {exc}") from exc
     txt(492, 216, "AUTHORIZED SIGNATURE", "Helvetica", 5.5, "center")
     txt(13, 211, "MEMO", "Helvetica-Bold", 9)
     txt(46, 211, memo, "Helvetica", 10, max_width=290)
@@ -607,6 +647,30 @@ with st.sidebar.expander("Edit bank information", expanded=False):
         }
         st.success("Applied for current session")
 st.sidebar.caption("For persistent storage, use BANK_ACCOUNTS in Streamlit Secrets. Do not commit real bank details to GitHub.")
+
+# ----------------- One default signature shared by every company/account -----------------
+st.sidebar.markdown("### Default signature")
+default_signature_bytes = load_default_signature()
+with st.sidebar.expander("Signature settings", expanded=False):
+    uploaded_signature = st.file_uploader(
+        "Temporary signature override (PNG/JPG)",
+        type=["png", "jpg", "jpeg"],
+        key="signature_upload",
+        help="This override is only for the current session. For a permanent default, configure CHECK_SIGNATURE_BASE64 in Secrets.",
+    )
+    if uploaded_signature is not None:
+        default_signature_bytes = uploaded_signature.getvalue()
+    if default_signature_bytes:
+        st.image(default_signature_bytes, caption="Shared signature preview", width=230)
+    else:
+        st.caption("No default signature configured. Add CHECK_SIGNATURE_BASE64 in Secrets or a private signature.png file.")
+    st.caption("Use only a signature you are authorized to apply. Restrict access to this app and archived PDFs.")
+include_signature = st.sidebar.checkbox(
+    "Include Signature", value=True, key="include_default_signature"
+)
+active_signature_bytes = default_signature_bytes if include_signature else None
+if include_signature and not default_signature_bytes:
+    st.sidebar.warning("Signature is enabled but no image is configured; checks will have a blank signature line.")
 
 # ----------------- 页面架构 -----------------
 st.sidebar.title("⚙ 系统导航")
@@ -837,7 +901,7 @@ if mode == "📝 Single Mannul Check":
         amount_words_text = number_to_words_usd(pay_amount)
 
     try:
-        filled_pdf = generate_check_pdf(company_display, account_num, project_site, check_num, pay_date, payee_name, pay_amount, memo_text, custom_bank=custom_bank)
+        filled_pdf = generate_check_pdf(company_display, account_num, project_site, check_num, pay_date, payee_name, pay_amount, memo_text, custom_bank=custom_bank, signature_bytes=active_signature_bytes)
         pdf_error = None
     except ValueError as e:
         filled_pdf = None
@@ -1198,7 +1262,7 @@ elif mode == "👷 Construction Bulk Checks":
                 }
     
                 try:
-                    pdf_res = generate_check_pdf(company_name, account_num, project_name, cur_check, pay_date, worker_name, amt, full_memo)
+                    pdf_res = generate_check_pdf(company_name, account_num, project_name, cur_check, pay_date, worker_name, amt, full_memo, signature_bytes=active_signature_bytes)
                 except ValueError as e:
                     st.error(f"Row {idx+1}: {e}")
                     st.stop()
