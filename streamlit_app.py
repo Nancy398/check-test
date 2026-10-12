@@ -471,7 +471,7 @@ def draw_check(c, payment, account, check_no, transit="A", on_us="C", signature_
             signature = ImageReader(io.BytesIO(signature_bytes))
             image_width, image_height = signature.getSize()
             # Fit within the signature area without stretching the image.
-            max_width, max_height = 125, 25
+            max_width, max_height = 170, 38
             scale = min(1.0, max_width / image_width, max_height / image_height)
             drawn_width, drawn_height = image_width * scale, image_height * scale
             c.drawImage(
