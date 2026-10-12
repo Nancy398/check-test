@@ -1,10 +1,9 @@
 streamlit
-pymupdf
-num2words
 pandas
 gspread
 google-auth
-PyPDF2
+google-api-python-client
 reportlab
-openpyxl
-fonttools
+num2words
+PyPDF2
+PyMuPDF
