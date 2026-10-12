@@ -720,7 +720,7 @@ if mode == "📝 Single Mannul Check":
             else:
                 memo_text = user_memo.strip()
 
-        amount_words = number_to_words_usd(pay_amount)
+        amount_words_text = number_to_words_usd(pay_amount)
 
     try:
         filled_pdf = generate_check_pdf(company_display, account_num, project_site, check_num, pay_date, payee_name, pay_amount, memo_text)
@@ -740,7 +740,7 @@ if mode == "📝 Single Mannul Check":
         > **Date**: {pay_date.strftime("%Y-%m-%d")}  
         > **Payee**: **{payee_name}**  
         > **Amount**: **${pay_amount:,.2f}**  
-        > **Amount Words**: *{amount_words}*  
+        > **Amount Words**: *{amount_words_text}*  
         > **Memo**: {memo_text}
         """)
 
