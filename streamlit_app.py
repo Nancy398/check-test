@@ -4,7 +4,7 @@ import io
 import os
 import zipfile
 import re
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 import fitz
 from num2words import num2words
 import pandas as pd
@@ -12,6 +12,8 @@ import streamlit as st
 import gspread
 from PyPDF2 import PdfMerger
 from google.oauth2.service_account import Credentials
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseUpload
 
 # ----------------- 页面配置 -----------------
 st.set_page_config(
@@ -77,6 +79,93 @@ def save_to_history(records):
     except Exception as e:
         st.error(f"❌ 数据保存至 Google Sheets 失败: {e}")
         return False
+
+# ----------------- Drive PDF archive (one merged PDF per company/account) -----------------
+def merged_pdf_filename(company, alias, issue_date, check_numbers):
+    """Date + company + check-number range; alias disambiguates multiple accounts."""
+    safe_company = re.sub(r"[^A-Za-z0-9_-]+", "_", str(company)).strip("_") or "Company"
+    safe_alias = re.sub(r"[^A-Za-z0-9_-]+", "_", str(alias)).strip("_") or "Account"
+    numbers = sorted(int(n) for n in check_numbers)
+    check_range = str(numbers[0]) if len(numbers) == 1 else f"{numbers[0]}-{numbers[-1]}"
+    return f"{issue_date.strftime('%Y-%m-%d')}_{safe_company}_{safe_alias}_Checks_{check_range}.pdf"
+
+
+def get_or_create_company_folder(service, root_folder_id, company):
+    """Reuse an existing company folder, or create one under Checks."""
+    safe_name = str(company).strip() or "Unknown Company"
+    escaped_name = safe_name.replace("\\", "\\\\").replace("'", "\\'")
+    query = (f"name = '{escaped_name}' and mimeType = 'application/vnd.google-apps.folder' "
+             f"and '{root_folder_id}' in parents and trashed = false")
+    result = service.files().list(
+        q=query, fields="nextPageToken,files(id,name)", page_size=100,
+        supportsAllDrives=True, includeItemsFromAllDrives=True,
+    ).execute()
+    folders = result.get("files", [])
+    if folders:
+        return folders[0]["id"]
+    created = service.files().create(
+        body={"name": safe_name, "mimeType": "application/vnd.google-apps.folder", "parents": [root_folder_id]},
+        fields="id", supportsAllDrives=True,
+    ).execute()
+    return created["id"]
+
+
+def upload_merged_pdfs_to_drive(merged_pdfs, issue_date, check_numbers_by_account):
+    """Archive each account PDF in Checks/<Company>/ and return its private Drive URL."""
+    root_folder_id = str(st.secrets.get("CHECK_PDF_DRIVE_FOLDER_ID", "")).strip()
+    if not root_folder_id:
+        raise ValueError("Set CHECK_PDF_DRIVE_FOLDER_ID to the Checks folder ID in Streamlit Secrets.")
+
+    creds_dict = dict(st.secrets["GOOGLE_APPLICATION_CREDENTIALS"])
+    if "private_key" in creds_dict:
+        creds_dict["private_key"] = creds_dict["private_key"].replace("\\n", "\n")
+    credentials = Credentials.from_service_account_info(
+        creds_dict,
+        scopes=["https://www.googleapis.com/auth/drive", "https://www.googleapis.com/auth/spreadsheets"],
+    )
+    service = build("drive", "v3", credentials=credentials, cache_discovery=False)
+    urls = {}
+    company_folders = {}
+    for (company, alias), pdf_data in merged_pdfs.items():
+        if company not in company_folders:
+            company_folders[company] = get_or_create_company_folder(service, root_folder_id, company)
+        filename = merged_pdf_filename(company, alias, issue_date, check_numbers_by_account[(company, alias)])
+        media = MediaIoBaseUpload(io.BytesIO(pdf_data), mimetype="application/pdf", resumable=False)
+        uploaded = service.files().create(
+            body={"name": filename, "parents": [company_folders[company]]},
+            media_body=media, fields="id,webViewLink", supportsAllDrives=True,
+        ).execute()
+        file_id = uploaded["id"]
+        urls[(company, alias)] = uploaded.get("webViewLink") or f"https://drive.google.com/file/d/{file_id}/view"
+    return urls
+
+
+def save_batch_with_pdf_links(records, pdf_urls):
+    """Append check history and the corresponding merged PDF link in one batch."""
+    try:
+        gc = get_gc_client()
+        ws = gc.open(GS_SPREADSHEET_NAME).worksheet(GS_WORKSHEET_NAME)
+        headers = ws.row_values(1)
+        if "PDF Link" not in headers:
+            ws.update_cell(1, len(headers) + 1, "PDF Link")
+            headers.append("PDF Link")
+        data = []
+        for r in records:
+            fields = {
+                "Check Number": r["Check Number"], "Issue Date": r["Issue Date"],
+                "Company": r["Company"], "Account": r["Account"],
+                "Project": r["Project"], "Stage": r.get("Stage", ""),
+                "Payee Name": r["Payee Name"], "Amount": r["Amount"],
+                "Memo": r["Memo"],
+                "PDF Link": pdf_urls.get((r["Company"], r["Account"]), ""),
+            }
+            data.append([fields.get(h, "") for h in headers])
+        ws.append_rows(data, value_input_option="USER_ENTERED")
+        return True
+    except Exception as e:
+        st.error(f"❌ Failed to save history/PDF links to Google Sheets: {e}")
+        return False
+
 
 # ----------------- 4. 计算最新可用支票号 -----------------
 def fetch_next_check_numbers_from_gs(df_p_list, default_start_number=1001):
@@ -225,8 +314,18 @@ def ensure_bank(alias, project=""):
         raise ValueError(f"Account {alias}: Account Number must contain digits only")
     return bank
 
-def generate_check_pdf(company, account_alias, project, check_no, pay_date, payee, amount, memo):
-    bank = ensure_bank(account_alias, project)
+def generate_check_pdf(company, account_alias, project, check_no, pay_date, payee, amount, memo, custom_bank=None):
+    if custom_bank is not None:
+        bank = dict(custom_bank)
+        missing = [k for k in ("Bank Name", "Routing Number", "Account Number") if not str(bank.get(k, "")).strip()]
+        if missing:
+            raise ValueError("Custom bank information missing: " + ", ".join(missing))
+        if not re.fullmatch(r"\d{9}", str(bank["Routing Number"]).strip()):
+            raise ValueError("Routing Number must be exactly 9 digits")
+        if not re.fullmatch(r"\d+", str(bank["Account Number"]).strip()):
+            raise ValueError("Account Number must contain digits only")
+    else:
+        bank = ensure_bank(account_alias, project)
     info = {
         "Company": str(company),
         "Company Address": DEFAULT_COMPANY_ADDRESS,
@@ -367,15 +466,6 @@ def draw_check(c, payment, account, check_no, transit="A", on_us="C"):
     txt(97, 352, "$"+amount_text, "Helvetica", 9)
     txt(7, 370, "MEMO:", "Helvetica-Bold", 9)
     txt(97, 370, memo, "Helvetica", 9, max_width=420)
-
-    txt(306, 402, "Print settings (layout proof):", "Helvetica-Bold", 10, "center")
-    for i, tip in enumerate([
-        "- US Letter (8.5 x 11 in), portrait orientation",
-        "- Print at 100% / Actual size (not Fit to page)",
-        "- Layout proof only: MICR and stock require bank verification",
-        "- No logo or background; verify details before issuance",
-    ]):
-        txt(55, 424 + i*20, tip, "Helvetica", 8.5, max_width=510)
 
     txt(306, 555, "Keep this copy for your records:", "Helvetica-Bold", 11, "center")
     # Miniature duplicate; plain black on white, no decorative branding.
@@ -670,6 +760,30 @@ if mode == "📝 Single Mannul Check":
 
         company_display = st.text_input("Company Display Name", value=company_name)
 
+        st.markdown("##### Bank Information")
+        manual_bank_mode = st.checkbox(
+            "Enter bank details manually for this check",
+            value=False,
+            key="single_manual_bank_mode",
+        )
+        custom_bank = None
+        if manual_bank_mode:
+            st.caption("These details apply only to this check and do not change saved bank accounts.")
+            custom_alias = st.text_input(
+                "Account Label (for Google Sheets history)",
+                value="Manual Account",
+                key="single_manual_account_label",
+            )
+            custom_bank_name = st.text_input("Bank Name", key="single_manual_bank_name")
+            custom_routing = st.text_input("Routing Number (9 digits)", key="single_manual_routing")
+            custom_account = st.text_input("Account Number", key="single_manual_account_number")
+            custom_bank = {
+                "Bank Name": custom_bank_name.strip(),
+                "Routing Number": custom_routing.strip(),
+                "Account Number": custom_account.strip(),
+            }
+            account_num = custom_alias.strip() or "Manual Account"
+
         st.caption("PDF is generated directly; no check template files required.")
 
         st.markdown("---")
@@ -723,7 +837,7 @@ if mode == "📝 Single Mannul Check":
         amount_words_text = number_to_words_usd(pay_amount)
 
     try:
-        filled_pdf = generate_check_pdf(company_display, account_num, project_site, check_num, pay_date, payee_name, pay_amount, memo_text)
+        filled_pdf = generate_check_pdf(company_display, account_num, project_site, check_num, pay_date, payee_name, pay_amount, memo_text, custom_bank=custom_bank)
         pdf_error = None
     except ValueError as e:
         filled_pdf = None
@@ -1131,12 +1245,29 @@ elif mode == "👷 Construction Bulk Checks":
                 st.session_state.last_generated_pdfs = merged_account_pdfs
                 # ------------------------------------------------------
     
-                if save_to_history(records_log):
-                    st.session_state.payroll_list = []
-    
-                    st.balloons()
-                    st.success(f"🎉 Successfully generated {len(records_log)} check(s)! Data synced to Google Sheets.")
-    
+                check_numbers_by_account = {}
+                for (company, alias), items in account_pdf_dict.items():
+                    check_numbers_by_account[(company, alias)] = [item[0] for item in items]
+
+                # Upload one merged PDF per company/account, then record its link for each check.
+                # PDFs are kept available for download even if Drive/Sheets syncing fails.
+                pdf_urls = {}
+                try:
+                    pdf_urls = upload_merged_pdfs_to_drive(merged_account_pdfs, pay_date, check_numbers_by_account)
+                    st.success(f"☁️ Uploaded {len(pdf_urls)} merged PDF(s) to Google Drive.")
+                except Exception as e:
+                    st.error(f"❌ Drive PDF upload failed: {e}")
+                    st.warning("PDFs were generated; download them below. No history was saved to avoid missing links.")
+
+                if pdf_urls and len(pdf_urls) == len(merged_account_pdfs):
+                    if save_batch_with_pdf_links(records_log, pdf_urls):
+                        st.session_state.payroll_list = []
+                        st.balloons()
+                        st.success(f"🎉 Saved {len(records_log)} checks and their merged PDF links to Google Sheets.")
+                    else:
+                        st.warning("Drive files were uploaded, but Google Sheets synchronization failed. Avoid regenerating without checking for duplicate Drive files.")
+
+                if records_log:
                     st.markdown("### 📊 Current Period Disbursement Summary")
                     df_batch = pd.DataFrame(records_log)
                     col_sum1, col_sum2 = st.columns(2)
@@ -1163,7 +1294,7 @@ elif mode == "👷 Construction Bulk Checks":
     
                     st.markdown("### 📥 Download Merged PDF Checks by Account")
                     for (company, acc_num), pdf_data in merged_account_pdfs.items():
-                        file_name = f"Checks_{company}_{acc_num}_{pay_date.strftime('%Y%m%d')}.pdf"
+                        file_name = merged_pdf_filename(company, acc_num, pay_date, check_numbers_by_account[(company, acc_num)])
                         st.download_button(
                             label=f"📄 Download Combined PDF for {company} ({acc_num})",
                             data=pdf_data,
