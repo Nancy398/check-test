@@ -319,6 +319,28 @@ def upload_merged_pdfs_to_drive(merged_pdfs, issue_date, check_numbers_by_accoun
     return urls
 
 
+def upload_all_checks_pdf_to_drive(pdf_data, issue_date, records):
+    """Upload one complete bulk PDF to the Checks root folder."""
+    root_folder_id = str(st.secrets.get("CHECK_PDF_DRIVE_FOLDER_ID", "")).strip()
+    if not root_folder_id:
+        raise ValueError("Set CHECK_PDF_DRIVE_FOLDER_ID in Streamlit Secrets.")
+    creds_dict = dict(st.secrets["GOOGLE_APPLICATION_CREDENTIALS"])
+    if "private_key" in creds_dict:
+        creds_dict["private_key"] = creds_dict["private_key"].replace("\\n", "\n")
+    credentials = Credentials.from_service_account_info(
+        creds_dict, scopes=["https://www.googleapis.com/auth/drive"]
+    )
+    service = build("drive", "v3", credentials=credentials, cache_discovery=False)
+    filename = f"{issue_date.strftime('%Y-%m-%d')}_All_Companies_{len(records)}_Checks.pdf"
+    media = MediaIoBaseUpload(io.BytesIO(pdf_data), mimetype="application/pdf", resumable=False)
+    uploaded = service.files().create(
+        body={"name": filename, "parents": [root_folder_id]},
+        media_body=media, fields="id,webViewLink", supportsAllDrives=True,
+    ).execute()
+    file_id = uploaded["id"]
+    return uploaded.get("webViewLink") or f"https://drive.google.com/file/d/{file_id}/view"
+
+
 def save_batch_with_pdf_links(records, pdf_urls):
     """Append check history and the corresponding merged PDF link in one batch."""
     try:
@@ -1537,51 +1559,40 @@ elif mode == "👷 Construction Bulk Checks":
                 })
     
             if records_log:
-                # ----------------- 新增：按账户合并 PDF -----------------
-                merged_account_pdfs = {}
-    
-                for (company, acc_num), items in account_pdf_dict.items():
-                    # 按照 Check Number (cur_check) 升序排序，保证连号输出
-                    sorted_items = sorted(items, key=lambda x: x[0])
-                    
-                    merger = PdfMerger()
-                    for item in sorted_items:
-                        pdf_bytes = item[3]  # 单张支票的 PDF Bytes
+                # Combine all checks into ONE PDF. Sort by company/account/check number
+                # so different bank accounts remain clearly grouped for printing.
+                merger = PdfMerger()
+                for (company, account), items in sorted(account_pdf_dict.items()):
+                    for check_no, project, worker, pdf_bytes in sorted(items, key=lambda x: x[0]):
                         merger.append(io.BytesIO(pdf_bytes))
-                    
-                    merged_output = io.BytesIO()
-                    merger.write(merged_output)
-                    merger.close()
-                    merged_output.seek(0)
-                    
-                    # 存储合并后的 PDF 二进制数据
-                    merged_account_pdfs[(company, acc_num)] = merged_output.getvalue()
-    
-                # 将合并后的 PDF 结果存入 session_state
-                st.session_state.last_generated_pdfs = merged_account_pdfs
-                # ------------------------------------------------------
-    
-                check_numbers_by_account = {}
-                for (company, alias), items in account_pdf_dict.items():
-                    check_numbers_by_account[(company, alias)] = [item[0] for item in items]
+                merged_output = io.BytesIO()
+                merger.write(merged_output)
+                merger.close()
+                all_checks_pdf = merged_output.getvalue()
+                all_checks_filename = f"{pay_date.strftime('%Y-%m-%d')}_All_Companies_{len(records_log)}_Checks.pdf"
 
-                # Upload one merged PDF per company/account, then record its link for each check.
-                # PDFs are kept available for download even if Drive/Sheets syncing fails.
-                pdf_urls = {}
+                # Keep download available across Streamlit reruns and after download.
+                st.session_state["last_bulk_pdf"] = all_checks_pdf
+                st.session_state["last_bulk_filename"] = all_checks_filename
+                st.session_state["last_bulk_count"] = len(records_log)
+
+                # One Drive PDF; every check history row points to that same file.
                 try:
-                    pdf_urls = upload_merged_pdfs_to_drive(merged_account_pdfs, pay_date, check_numbers_by_account)
-                    st.success(f"☁️ Uploaded {len(pdf_urls)} merged PDF(s) to Google Drive.")
+                    drive_url = upload_all_checks_pdf_to_drive(all_checks_pdf, pay_date, records_log)
+                    st.success("☁️ Uploaded one complete bulk PDF to Google Drive.")
                 except Exception as e:
+                    drive_url = None
                     st.error(f"❌ Drive PDF upload failed: {e}")
-                    st.warning("PDFs were generated; download them below. No history was saved to avoid missing links.")
+                    st.warning("The combined PDF is available below. No history was saved to avoid missing links.")
 
-                if pdf_urls and len(pdf_urls) == len(merged_account_pdfs):
+                if drive_url:
+                    pdf_urls = {(r["Company"], r["Account"]): drive_url for r in records_log}
                     if save_batch_with_pdf_links(records_log, pdf_urls):
                         st.session_state.payroll_list = []
                         st.balloons()
-                        st.success(f"🎉 Saved {len(records_log)} checks and their merged PDF links to Google Sheets.")
+                        st.success(f"🎉 Saved {len(records_log)} checks to Google Sheets, all linked to the same PDF.")
                     else:
-                        st.warning("Drive files were uploaded, but Google Sheets synchronization failed. Avoid regenerating without checking for duplicate Drive files.")
+                        st.warning("Drive upload succeeded, but Sheets sync failed. Check before generating again to avoid duplicates.")
 
                 if records_log:
                     st.markdown("### 📊 Current Period Disbursement Summary")
@@ -1608,12 +1619,18 @@ elif mode == "👷 Construction Bulk Checks":
                         ).reset_index()
                         st.dataframe(summary_project.style.format({"Total Labor Cost": "${:,.2f}"}), use_container_width=True, hide_index=True)
     
-                    st.markdown("### 📥 Download Merged PDF Checks by Account")
-                    for (company, acc_num), pdf_data in merged_account_pdfs.items():
-                        file_name = merged_pdf_filename(company, acc_num, pay_date, check_numbers_by_account[(company, acc_num)])
-                        st.download_button(
-                            label=f"📄 Download Combined PDF for {company} ({acc_num})",
-                            data=pdf_data,
-                            file_name=file_name,
-                            mime="application/pdf"
-                        )
+
+
+    # Always render the most recently generated PDF, even after a Streamlit rerun.
+    if st.session_state.get("last_bulk_pdf"):
+        st.markdown("### 📥 Download All Checks (One PDF)")
+        st.caption(f"{st.session_state.get('last_bulk_count', 0)} checks, all companies and accounts, in one file.")
+        st.download_button(
+            label="📄 Download All Checks — One PDF",
+            data=st.session_state["last_bulk_pdf"],
+            file_name=st.session_state["last_bulk_filename"],
+            mime="application/pdf",
+            key="download_all_bulk_checks",
+            use_container_width=True,
+            on_click="ignore",
+        )
