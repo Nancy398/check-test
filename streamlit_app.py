@@ -15,6 +15,184 @@ from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
 from reportlab.lib.utils import ImageReader
+from google.auth.transport.requests import AuthorizedSession
+from collections import defaultdict
+
+
+
+# -------- Weekly checklist import: Google Cloud Vision OCR + manual review --------
+def checklist_ocr(upload):
+    """Read an image or scanned PDF with Google Cloud Vision (must be enabled in GCP)."""
+    raw = upload.getvalue()
+    images = []
+    if upload.name.lower().endswith(".pdf"):
+        doc = fitz.open(stream=raw, filetype="pdf")
+        if len(doc) > 10:
+            raise ValueError("Please upload no more than 10 PDF pages at a time.")
+        for page in doc:
+            images.append(page.get_pixmap(matrix=fitz.Matrix(1.5, 1.5), alpha=False).tobytes("png"))
+        doc.close()
+    else:
+        images = [raw]
+    creds_dict = dict(st.secrets["GOOGLE_APPLICATION_CREDENTIALS"])
+    creds_dict["private_key"] = creds_dict["private_key"].replace("\\n", "\n")
+    creds = Credentials.from_service_account_info(creds_dict, scopes=["https://www.googleapis.com/auth/cloud-platform"])
+    session = AuthorizedSession(creds)
+    parsed = []
+    for image_bytes in images:
+        payload = {"requests": [{"image": {"content": base64.b64encode(image_bytes).decode("ascii")},
+                                "features": [{"type": "DOCUMENT_TEXT_DETECTION"}]}]}
+        response = session.post("https://vision.googleapis.com/v1/images:annotate", json=payload, timeout=60)
+        if not response.ok:
+            raise RuntimeError(f"Cloud Vision error {response.status_code}: {response.text[:350]}")
+        result = response.json()["responses"][0]
+        if result.get("error"):
+            raise RuntimeError(result["error"].get("message", "Cloud Vision failed"))
+        parsed.extend(checklist_rows_from_vision(result))
+    return parsed
+
+
+def checklist_rows_from_vision(result):
+    """Reconstruct checklist rows from OCR word coordinates, preserving separate occurrences."""
+    extracted = []
+    for page in result.get("fullTextAnnotation", {}).get("pages", []):
+        words = []
+        for block in page.get("blocks", []):
+            for para in block.get("paragraphs", []):
+                for word in para.get("words", []):
+                    txt = "".join(c.get("text", "") for c in word.get("symbols", []))
+                    verts = word.get("boundingBox", {}).get("vertices", [])
+                    if not verts or not txt:
+                        continue
+                    x = min(v.get("x", 0) for v in verts)
+                    y = sum(v.get("y", 0) for v in verts) / len(verts)
+                    height = max(v.get("y", 0) for v in verts) - min(v.get("y", 0) for v in verts)
+                    words.append((x, y, max(height, 8), txt))
+        if not words:
+            continue
+        page_width = page.get("width", 1)
+        lines = []
+        for x, y, h, txt in sorted(words, key=lambda v: v[1]):
+            closest = min(lines, key=lambda line: abs(line["y"] - y), default=None)
+            if closest and abs(closest["y"] - y) <= max(9, min(20, h * .6)):
+                closest["words"].append((x, txt))
+                closest["y"] = (closest["y"] * (len(closest["words"]) - 1) + y) / len(closest["words"])
+            else:
+                lines.append({"y": y, "words": [(x, txt)]})
+        for line in sorted(lines, key=lambda l: l["y"]):
+            chunks = [[], [], []]
+            for x, txt in sorted(line["words"]):
+                col = 0 if x < page_width * .51 else (1 if x < page_width * .76 else 2)
+                chunks[col].append(txt)
+            name, amount, project = (" ".join(c).strip() for c in chunks)
+            name = name.rstrip(" .:")
+            amount_match = re.search(r"\d[\d,]*(?:\.\d{1,2})?", amount.replace(" ", ""))
+            amount_value = amount_match.group(0).replace(",", "") if amount_match else ""
+            if len(name) < 3 or not re.search(r"[A-Za-z]", name):
+                continue
+            if name.lower() in ("name", "worker", "frank workers"):
+                continue
+            # Include uncertain rows for human review rather than silently dropping them.
+            extracted.append({"Payee": name, "Total": amount_value, "Projects": project,
+                              "Raw": " | ".join([name, amount, project])})
+    return extracted
+
+
+def resolve_checklist_project(token, projects):
+    """Match exact project names, Project_Code if supplied, or standalone numeric codes."""
+    norm = lambda x: re.sub(r"[^a-z0-9]", "", str(x).lower())
+    needle = norm(token)
+    if not needle:
+        return None
+    matches = []
+    for _, p in projects.iterrows():
+        name = str(p.get("Project_Name", "")).strip()
+        code = str(p.get("Project_Code", "")).strip()
+        candidates = [norm(name)]
+        if code and code.lower() != "nan":
+            candidates.append(norm(code))
+        # Numeric project labels can be embedded in names, but only on digit boundaries.
+        if needle.isdigit() and re.search(r"(?<!\d)" + re.escape(needle) + r"(?!\d)", name):
+            candidates.append(needle)
+        if needle in candidates:
+            matches.append(name)
+    return matches[0] if len(set(matches)) == 1 else None
+
+
+def split_cents_evenly(total, n):
+    cents = int((Decimal(str(total)) * 100).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+    base, remainder = divmod(cents, n)
+    return [(base + (1 if i < remainder else 0)) / 100 for i in range(n)]
+
+
+def expand_weekly_rows(rows, projects):
+    expanded = []
+    for source_index, row in enumerate(rows, 1):
+        name = str(row.get("Payee", "")).strip()
+        total_str = str(row.get("Total", "")).strip().replace("$", "").replace(",", "")
+        tokens = [v.strip() for v in re.split(r"[/;]", str(row.get("Projects", ""))) if v.strip()]
+        try:
+            total = Decimal(total_str)
+            valid_amount = total.is_finite() and total > 0
+        except (InvalidOperation, ValueError):
+            total, valid_amount = Decimal(0), False
+        amounts = split_cents_evenly(total, len(tokens)) if valid_amount and tokens else [0] * len(tokens)
+        if not tokens:
+            expanded.append({"Source": source_index, "Payee": name, "Original Total": float(total),
+                             "Project Code": "", "Project": "", "Amount": 0.0,
+                             "Status": "Missing project", "Raw": row.get("Raw", "")})
+        for i, token in enumerate(tokens):
+            matched = resolve_checklist_project(token, projects)
+            status = "Ready" if matched and valid_amount and name else ("Missing amount" if not valid_amount else "Project not matched")
+            expanded.append({"Source": source_index, "Payee": name, "Original Total": float(total),
+                             "Project Code": token, "Project": matched or "", "Amount": amounts[i],
+                             "Status": status, "Raw": row.get("Raw", "")})
+    return expanded
+
+
+def validate_weekly_rows(rows, projects):
+    errors = []
+    groups = defaultdict(list)
+    valid_projects = set(projects["Project_Name"].astype(str)) if not projects.empty else set()
+    for idx, row in enumerate(rows):
+        source = row.get("Source")
+        groups[source].append(row)
+        try:
+            amount = Decimal(str(row.get("Amount", "")))
+            total = Decimal(str(row.get("Original Total", "")))
+        except (InvalidOperation, ValueError):
+            errors.append(f"Row {idx+1}: invalid amount")
+            continue
+        if amount <= 0 or not amount.is_finite():
+            errors.append(f"Row {idx+1}: amount must be greater than zero")
+        if not str(row.get("Payee", "")).strip():
+            errors.append(f"Row {idx+1}: missing payee")
+        project = str(row.get("Project", "")).strip()
+        if project not in valid_projects:
+            errors.append(f"Row {idx+1}: project not matched to Google Sheets")
+        else:
+            p = projects.loc[projects["Project_Name"] == project].iloc[0]
+            if not str(p.get("Company", "")).strip() or not str(p.get("Account", "")).strip():
+                errors.append(f"Row {idx+1}: project missing company or bank account")
+    for source, parts in groups.items():
+        try:
+            actual = sum(Decimal(str(p["Amount"])) for p in parts)
+            expected = Decimal(str(parts[0]["Original Total"]))
+            if abs(actual - expected) > Decimal("0.001"):
+                errors.append(f"Source {source}: split ${actual:.2f} does not match original ${expected:.2f}")
+        except (InvalidOperation, ValueError):
+            errors.append(f"Source {source}: invalid totals")
+    return errors
+
+
+def next_number_for_account(company, account, history, staged, project_starts):
+    nums = []
+    if not history.empty and {"Company", "Account", "Check Number"}.issubset(history.columns):
+        matching = history[(history["Company"].astype(str) == company) & (history["Account"].astype(str) == account)]
+        nums.extend(pd.to_numeric(matching["Check Number"], errors="coerce").dropna().astype(int).tolist())
+    nums.extend(int(r.get("Check #", 0)) for r in staged if str(r.get("Company", "")) == company and str(r.get("Account", "")) == account)
+    return max(nums, default=int(project_starts)) + 1 if nums else int(project_starts)
+
 
 # ----------------- 页面配置 -----------------
 st.set_page_config(
@@ -472,7 +650,7 @@ def draw_check(c, payment, account, check_no, transit="A", on_us="C", signature_
             image_width, image_height = signature.getSize()
             # Fit within the signature area without stretching the image.
             max_width, max_height = 170, 38
-            scale = min(1.0, max_width / image_width, max_height / image_height)
+            scale = min(max_width / image_width, max_height / image_height)
             drawn_width, drawn_height = image_width * scale, image_height * scale
             c.drawImage(
                 signature,
@@ -485,8 +663,8 @@ def draw_check(c, payment, account, check_no, transit="A", on_us="C", signature_
         except Exception as exc:
             raise ValueError(f"Unable to draw signature image: {exc}") from exc
     txt(492, 216, "AUTHORIZED SIGNATURE", "Helvetica", 5.5, "center")
-    txt(13, 190, "MEMO", "Helvetica-Bold", 9)
-    txt(46, 190, memo, "Helvetica", 10, max_width=290)
+    txt(13, 211, "MEMO", "Helvetica-Bold", 9)
+    txt(46, 211, memo, "Helvetica", 10, max_width=290)
 
     # MICR line: mapping and alignment must be validated by the bank/printer.
     line = micr_string(check_no, account["Routing Number"], account["Account Number"], transit, on_us)
@@ -1017,6 +1195,56 @@ elif mode == "👷 Construction Bulk Checks":
     if "payroll_list" not in st.session_state:
         st.session_state.payroll_list = []
 
+    st.markdown("### 📸 Upload Weekly Payroll Checklist")
+    st.caption("Upload screenshots or scanned PDFs. OCR uses Google Cloud Vision; enable the Vision API for the service account project. Review every row before generating checks.")
+    weekly_files = st.file_uploader("Weekly checklist images / PDF", type=["png", "jpg", "jpeg", "pdf"], accept_multiple_files=True, key="weekly_checklist_upload")
+    if st.button("🔍 Read checklist", disabled=not weekly_files):
+        try:
+            extracted = []
+            for uploaded in weekly_files:
+                extracted.extend(checklist_ocr(uploaded))
+            st.session_state.weekly_raw_rows = extracted
+            st.session_state.weekly_review_rows = expand_weekly_rows(extracted, df_projects)
+            st.success(f"OCR returned {len(extracted)} potential worker entries. Please review all fields.")
+        except Exception as exc:
+            st.error(f"Checklist recognition failed: {exc}")
+            st.info("Check Google Cloud Vision API activation and service-account access, or use manual bulk entry below.")
+    if st.session_state.get("weekly_review_rows") is not None:
+        st.caption("Source identifies each original checklist line. Multiple projects are split equally by default. Adjust Amount for exceptions; every source must still total its Original Total.")
+        weekly_df = pd.DataFrame(st.session_state.weekly_review_rows)
+        if not weekly_df.empty:
+            reviewed = st.data_editor(weekly_df, num_rows="dynamic", hide_index=True,
+                disabled=["Source", "Original Total", "Raw", "Status"],
+                column_config={"Project": st.column_config.SelectboxColumn("Project", options=preset_project_list),
+                               "Amount": st.column_config.NumberColumn("Amount", min_value=0, format="$%.2f")},
+                key="weekly_review_editor", use_container_width=True)
+            st.session_state.weekly_review_rows = reviewed.to_dict("records")
+            issues = validate_weekly_rows(st.session_state.weekly_review_rows, df_projects)
+            if issues:
+                st.warning(f"{len(issues)} item(s) require attention: " + "; ".join(issues[:8]))
+            if st.button("➕ Add reviewed checks to batch", disabled=bool(issues)):
+                history = read_file(GS_SPREADSHEET_NAME, GS_WORKSHEET_NAME)
+                staged = list(st.session_state.payroll_list)
+                for row in st.session_state.weekly_review_rows:
+                    project = str(row["Project"])
+                    p = df_projects.loc[df_projects["Project_Name"] == project].iloc[0]
+                    company, account = str(p["Company"]).strip(), str(p["Account"]).strip()
+                    # Bank aliases must be configured; never silently substitute an unrelated account.
+                    ensure_bank(account, project)
+                    start = proj_start_nums.get(project, 1001)
+                    number = next_number_for_account(company, account, history, staged, start)
+                    staged.append({"Company": company, "Payee": str(row["Payee"]).strip(),
+                                   "Project": project, "Account": account, "Stage": "Weekly Payroll",
+                                   "Days": None, "Rate": None, "Check #": number,
+                                   "Amount": float(row["Amount"]), "Memo": "Weekly Payroll"})
+                st.session_state.payroll_list = staged
+                st.session_state.weekly_review_rows = None
+                st.success(f"Added {len(reviewed)} checks to the batch for final review.")
+                st.rerun()
+        else:
+            st.warning("No recognizable checklist rows. Try a clearer photo or enter the rows manually.")
+    st.markdown("---")
+
     def update_bulk_stage_and_memo():
         selected_w = st.session_state.get("input_w", "")
         selected_p = st.session_state.get("input_p", "")
@@ -1229,7 +1457,10 @@ elif mode == "👷 Construction Bulk Checks":
 
     # ----------------- 4. 批量生成与导出 -----------------
     if not df_payroll_input.empty:
-        if st.button(f"🚀 Confirm & Batch Generate {len(df_payroll_input)} Checks", type="primary", use_container_width=True):
+        duplicates = df_payroll_input.duplicated(subset=["Company", "Account", "Check #"], keep=False)
+        if duplicates.any():
+            st.error("Duplicate Check Numbers for the same Company / Account. Edit them before generating checks.")
+        if st.button(f"🚀 Confirm & Batch Generate {len(df_payroll_input)} Checks", type="primary", use_container_width=True, disabled=bool(duplicates.any())):
             account_pdf_dict = {}
             records_log = []
     
