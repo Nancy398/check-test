@@ -425,6 +425,42 @@ def latest_stage_for_worker(history, payee, project):
     return str((matching if not matching.empty else data).iloc[-1]["Stage"])
 
 
+# ----------------- Stage choices and check memo -----------------
+def stage_code_only(value):
+    """Extract the saved stage code from 'CODE (Sub-Stage)' history values."""
+    value = str(value or "").strip()
+    return value.split(" (", 1)[0].strip()
+
+
+def saved_sub_stage(value):
+    match = re.search(r"\((.*?)\)\s*$", str(value or ""))
+    return match.group(1).strip() if match else ""
+
+
+def default_memo_for_stage(stage_code, sub_stage, stage_presets):
+    """Generate the detail only; project name is added once during PDF generation."""
+    code = stage_code_only(stage_code)
+    name = code
+    if not stage_presets.empty and {"Stage", "Stage_Name"}.issubset(stage_presets.columns):
+        matches = stage_presets.loc[stage_presets["Stage"].astype(str).str.strip() == code]
+        if not matches.empty:
+            name = str(matches.iloc[0]["Stage_Name"]).strip() or code
+    sub = str(sub_stage or "").strip()
+    return " - ".join(part for part in [name, sub] if part)
+
+
+def format_check_memo(project, detail):
+    """Do not duplicate project if user has already entered it in Memo."""
+    project, detail = str(project or "").strip(), str(detail or "").strip()
+    if not project:
+        return detail
+    if not detail:
+        return project
+    if detail.casefold() == project.casefold() or detail.casefold().startswith((project + " - ").casefold()):
+        return detail
+    return f"{project} - {detail}"
+
+
 # ----------------- 4. 计算最新可用支票号 -----------------
 def fetch_next_check_numbers_from_gs(df_p_list, default_start_number=1001):
     next_numbers = {}
@@ -1328,10 +1364,14 @@ elif mode == "👷 Construction Bulk Checks":
                     # Use the latest saved Stage for this worker/project; users can
                     # override Stage and Memo in the final Review & Edit table.
                     prior_stage = latest_stage_for_worker(history, row["Payee"], project)
+                    stage_code = stage_code_only(prior_stage)
+                    sub_stage = saved_sub_stage(prior_stage)
                     staged.append({"Company": company, "Payee": str(row["Payee"]).strip(),
-                                   "Project": project, "Account": account, "Stage": prior_stage,
+                                   "Project": project, "Account": account, "Stage": stage_code,
+                                   "Sub-Stage": sub_stage,
                                    "Days": None, "Rate": None, "Check #": number,
-                                   "Amount": float(row["Amount"]), "Memo": "Weekly Payroll"})
+                                   "Amount": float(row["Amount"]),
+                                   "Memo": default_memo_for_stage(stage_code, sub_stage, df_stages)})
                 st.session_state.payroll_list = staged
                 st.session_state.weekly_review_rows = None
                 st.success(f"Added {len(reviewed)} checks. Stage defaults to the latest saved stage for each worker/project; review and edit it below before generating.")
@@ -1505,7 +1545,8 @@ elif mode == "👷 Construction Bulk Checks":
                 "Payee": add_worker,
                 "Project": final_project_val,
                 "Account": add_account,
-                "Stage": stage_val_str,
+                "Stage": str(st_code),
+                "Sub-Stage": str(sub1) + (f", {sub2}" if sub2 else ""),
                 "Days": add_days if add_days > 0 else None,
                 "Rate": add_rate if add_rate > 0 else None,
                 "Check #": int(next_chk),
@@ -1529,18 +1570,33 @@ elif mode == "👷 Construction Bulk Checks":
     df_payroll_input = pd.DataFrame(st.session_state.payroll_list)
 
     if not df_payroll_input.empty:
+        # Keep existing historical values selectable even when a Stage was
+        # removed from the current Stage preset sheet.
+        df_payroll_input["Stage"] = df_payroll_input["Stage"].fillna("").map(stage_code_only)
+        if "Sub-Stage" not in df_payroll_input.columns:
+            df_payroll_input["Sub-Stage"] = ""
+        df_payroll_input["Sub-Stage"] = df_payroll_input["Sub-Stage"].fillna("").astype(str)
+        stage_options = [""] + sorted(set(
+            df_stages["Stage"].dropna().astype(str).str.strip().tolist()
+            if not df_stages.empty and "Stage" in df_stages.columns else []
+        ).union(set(df_payroll_input["Stage"].tolist())) - {""})
+        sub_options = [""] + sorted(set(
+            df_stages["Sub_Stage"].dropna().astype(str).str.strip().tolist()
+            if not df_stages.empty and "Sub_Stage" in df_stages.columns else []
+        ).union(set(df_payroll_input["Sub-Stage"].tolist())) - {""})
         edited_df = st.data_editor(
             df_payroll_input,
             num_rows="dynamic",
             use_container_width=True,
             column_config={
-                "Company": st.column_config.SelectboxColumn("Company", options=["Development Company", "Moo Housing", "Moo Construction"], required=True),
-                "Payee": st.column_config.SelectboxColumn("Payee", options=preset_worker_list, required=True),
+                "Company": st.column_config.TextColumn("Company"),
+                "Payee": st.column_config.TextColumn("Payee"),
                 "Project": st.column_config.SelectboxColumn("Project", options=[""] + preset_project_list),
                 "Check #": st.column_config.NumberColumn("Check #", format="%d"),
                 "Amount": st.column_config.NumberColumn("Amount", format="$%.2f"),
-                "Stage": st.column_config.TextColumn("Stage (latest history; editable)"),
-                "Memo": st.column_config.TextColumn("Memo (editable)"),
+                "Stage": st.column_config.SelectboxColumn("Stage (latest; selectable)", options=stage_options),
+                "Sub-Stage": st.column_config.SelectboxColumn("Sub-Stage (selectable)", options=sub_options),
+                "Memo": st.column_config.TextColumn("Memo detail (editable)"),
                 "Days": st.column_config.NumberColumn("Days", format="%.1f"),
                 "Rate": st.column_config.NumberColumn("Rate", format="$%.2f")
             },
@@ -1566,7 +1622,9 @@ elif mode == "👷 Construction Bulk Checks":
             for idx, row in df_payroll_input.iterrows():
                 worker_name = str(row.get("Payee", "")).strip()
                 project_name = str(row.get("Project", "")).strip()
-                stage_name = str(row.get("Stage", "")).strip()
+                stage_code = stage_code_only(row.get("Stage", ""))
+                sub_stage = str(row.get("Sub-Stage", "") or "").strip()
+                stage_name = f"{stage_code} ({sub_stage})" if stage_code and sub_stage else stage_code
                 
                 try:
                     cur_check = int(row.get("Check #", 0))
@@ -1575,7 +1633,11 @@ elif mode == "👷 Construction Bulk Checks":
                     cur_check = 0
                     amt = 0.0
     
-                detail_memo = str(row.get("Memo", "")).strip()
+                detail_memo = str(row.get("Memo", "") or "").strip()
+                # If a user changes Stage/Sub-Stage but leaves the old default
+                # memo untouched, the displayed memo remains explicitly editable.
+                if not detail_memo or detail_memo == "Weekly Payroll":
+                    detail_memo = default_memo_for_stage(stage_code, sub_stage, df_stages)
     
                 if amt <= 0 or not worker_name or cur_check <= 0:
                     continue
@@ -1593,12 +1655,7 @@ elif mode == "👷 Construction Bulk Checks":
                 else:
                     account_num = str(row.get("Account", "")).strip() or str(p_info.get("Account", "ACC-8652")).strip()
     
-                if project_name and detail_memo:
-                    full_memo = f"{project_name} - {detail_memo}"
-                elif project_name:
-                    full_memo = project_name
-                else:
-                    full_memo = detail_memo
+                full_memo = format_check_memo(project_name, detail_memo)
     
                 replacements = {
                     "date": pay_date.strftime("%m/%d/%Y"),
