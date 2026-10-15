@@ -397,6 +397,34 @@ def save_batch_with_pdf_links(records, pdf_urls):
         return False
 
 
+# ----------------- Most recent Stage from issued-check history -----------------
+def latest_stage_for_worker(history, payee, project):
+    """Prefer the most recent check for the same payee AND project.
+
+    Fall back to the same payee across projects. Never infer a stage from
+    an unrelated worker; blank history returns a reviewable blank value.
+    """
+    required = {"Payee Name", "Project", "Stage", "Issue Date"}
+    if history is None or history.empty or not required.issubset(history.columns):
+        return ""
+    data = history.copy()
+    names = data["Payee Name"].fillna("").astype(str).str.strip().str.casefold()
+    target = str(payee).strip().casefold()
+    data = data.loc[names == target].copy()
+    if data.empty:
+        return ""
+    data["Stage"] = data["Stage"].fillna("").astype(str).str.strip()
+    data = data.loc[data["Stage"] != ""].copy()
+    if data.empty:
+        return ""
+    data["_date"] = pd.to_datetime(data["Issue Date"], errors="coerce")
+    data["_check"] = pd.to_numeric(data.get("Check Number", pd.Series(index=data.index, dtype=object)), errors="coerce")
+    data["_order"] = range(len(data))
+    data = data.sort_values(["_date", "_check", "_order"], na_position="first")
+    matching = data.loc[data["Project"].fillna("").astype(str).str.strip().str.casefold() == str(project).strip().casefold()]
+    return str((matching if not matching.empty else data).iloc[-1]["Stage"])
+
+
 # ----------------- 4. 计算最新可用支票号 -----------------
 def fetch_next_check_numbers_from_gs(df_p_list, default_start_number=1001):
     next_numbers = {}
@@ -1297,13 +1325,16 @@ elif mode == "👷 Construction Bulk Checks":
                     ensure_bank(account, project)
                     start = proj_start_nums.get(project, 1001)
                     number = next_number_for_account(company, account, history, staged, start)
+                    # Use the latest saved Stage for this worker/project; users can
+                    # override Stage and Memo in the final Review & Edit table.
+                    prior_stage = latest_stage_for_worker(history, row["Payee"], project)
                     staged.append({"Company": company, "Payee": str(row["Payee"]).strip(),
-                                   "Project": project, "Account": account, "Stage": "Weekly Payroll",
+                                   "Project": project, "Account": account, "Stage": prior_stage,
                                    "Days": None, "Rate": None, "Check #": number,
                                    "Amount": float(row["Amount"]), "Memo": "Weekly Payroll"})
                 st.session_state.payroll_list = staged
                 st.session_state.weekly_review_rows = None
-                st.success(f"Added {len(reviewed)} checks to the batch for final review.")
+                st.success(f"Added {len(reviewed)} checks. Stage defaults to the latest saved stage for each worker/project; review and edit it below before generating.")
                 st.rerun()
         else:
             st.warning("No recognizable checklist rows. Try a clearer photo or enter the rows manually.")
@@ -1508,6 +1539,8 @@ elif mode == "👷 Construction Bulk Checks":
                 "Project": st.column_config.SelectboxColumn("Project", options=[""] + preset_project_list),
                 "Check #": st.column_config.NumberColumn("Check #", format="%d"),
                 "Amount": st.column_config.NumberColumn("Amount", format="$%.2f"),
+                "Stage": st.column_config.TextColumn("Stage (latest history; editable)"),
+                "Memo": st.column_config.TextColumn("Memo (editable)"),
                 "Days": st.column_config.NumberColumn("Days", format="%.1f"),
                 "Rate": st.column_config.NumberColumn("Rate", format="$%.2f")
             },
