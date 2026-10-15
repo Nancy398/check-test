@@ -21,6 +21,35 @@ from collections import defaultdict
 
 
 # -------- Weekly checklist import: Google Cloud Vision OCR + manual review --------
+def checklist_rows_from_excel(upload):
+    """Import one row per worker from the provided Weekly Payroll Excel template."""
+    try:
+        df = pd.read_excel(io.BytesIO(upload.getvalue()), sheet_name=0, dtype={"Payee": str, "Projects": str}, engine="openpyxl")
+    except ImportError as exc:
+        raise ValueError("Excel import requires openpyxl. Add openpyxl to requirements.txt.") from exc
+    except Exception as exc:
+        raise ValueError(f"Cannot read Excel file: {exc}") from exc
+    df.columns = [str(c).strip() for c in df.columns]
+    required = {"Payee", "Total", "Projects"}
+    if not required.issubset(df.columns):
+        raise ValueError("Excel columns must include: Payee, Total, Projects (use the supplied template).")
+    parsed = []
+    for i, row in df.iterrows():
+        name = "" if pd.isna(row["Payee"]) else str(row["Payee"]).strip()
+        if not name:
+            continue
+        raw_amount = row["Total"]
+        amount = "" if pd.isna(raw_amount) else str(raw_amount).strip()
+        projects = "" if pd.isna(row["Projects"]) else str(row["Projects"]).strip()
+        if projects.endswith(".0") and projects[:-2].isdigit():
+            projects = projects[:-2]
+        parsed.append({"Payee": name, "Total": amount, "Projects": projects,
+                       "Raw": f"Excel row {i+2}: {name} | {amount} | {projects}"})
+    if not parsed:
+        raise ValueError("No worker rows found in Excel.")
+    return parsed
+
+
 def checklist_ocr(upload):
     """Read an image or scanned PDF with Google Cloud Vision (must be enabled in GCP)."""
     raw = upload.getvalue()
@@ -1217,20 +1246,33 @@ elif mode == "👷 Construction Bulk Checks":
     if "payroll_list" not in st.session_state:
         st.session_state.payroll_list = []
 
-    st.markdown("### 📸 Upload Weekly Payroll Checklist")
-    st.caption("Upload screenshots or scanned PDFs. OCR uses Google Cloud Vision; enable the Vision API for the service account project. Review every row before generating checks.")
-    weekly_files = st.file_uploader("Weekly checklist images / PDF", type=["png", "jpg", "jpeg", "pdf"], accept_multiple_files=True, key="weekly_checklist_upload")
-    if st.button("🔍 Read checklist", disabled=not weekly_files):
-        try:
-            extracted = []
-            for uploaded in weekly_files:
-                extracted.extend(checklist_ocr(uploaded))
-            st.session_state.weekly_raw_rows = extracted
-            st.session_state.weekly_review_rows = expand_weekly_rows(extracted, df_projects)
-            st.success(f"OCR returned {len(extracted)} potential worker entries. Please review all fields.")
-        except Exception as exc:
-            st.error(f"Checklist recognition failed: {exc}")
-            st.info("Check Google Cloud Vision API activation and service-account access, or use manual bulk entry below.")
+    st.markdown("### 📋 Import Weekly Payroll Checklist")
+    import_type = st.radio("Import method", ["Excel (.xlsx) — recommended", "Image / PDF (Vision OCR)"], horizontal=True)
+    if import_type.startswith("Excel"):
+        st.caption("Use columns Payee, Total, Projects. Separate multiple project codes with / (e.g. 6528/83). Amounts are split equally by default. Blank amounts/projects require review.")
+        weekly_excel = st.file_uploader("Upload Weekly Payroll Excel", type=["xlsx"], key="weekly_excel_upload")
+        if st.button("📊 Import Excel", disabled=weekly_excel is None):
+            try:
+                extracted = checklist_rows_from_excel(weekly_excel)
+                st.session_state.weekly_raw_rows = extracted
+                st.session_state.weekly_review_rows = expand_weekly_rows(extracted, df_projects)
+                st.success(f"Imported {len(extracted)} worker rows. Review the split amounts and projects below.")
+            except Exception as exc:
+                st.error(f"Excel import failed: {exc}")
+    else:
+        st.caption("Image OCR uses Google Cloud Vision. Review every name, amount, and project before generating checks.")
+        weekly_files = st.file_uploader("Weekly checklist images / PDF", type=["png", "jpg", "jpeg", "pdf"], accept_multiple_files=True, key="weekly_checklist_upload")
+        if st.button("🔍 Read checklist", disabled=not weekly_files):
+            try:
+                extracted = []
+                for uploaded in weekly_files:
+                    extracted.extend(checklist_ocr(uploaded))
+                st.session_state.weekly_raw_rows = extracted
+                st.session_state.weekly_review_rows = expand_weekly_rows(extracted, df_projects)
+                st.success(f"OCR returned {len(extracted)} potential worker entries. Please review all fields.")
+            except Exception as exc:
+                st.error(f"Checklist recognition failed: {exc}")
+                st.info("Check Google Cloud Vision API activation and service-account access, or import Excel instead.")
     if st.session_state.get("weekly_review_rows") is not None:
         st.caption("Source identifies each original checklist line. Multiple projects are split equally by default. Adjust Amount for exceptions; every source must still total its Original Total.")
         weekly_df = pd.DataFrame(st.session_state.weekly_review_rows)
