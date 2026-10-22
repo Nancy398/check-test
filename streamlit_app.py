@@ -751,20 +751,21 @@ def draw_check(c, payment, account, check_no, transit="A", on_us="C", signature_
     txt(29, 129, words, size=9.3, max_width=495)
     txt(603, 132, "DOLLARS", size=7, align="right")
 
-    txt(25, 204, "MEMO", size=8)
-    txt(68, 204, memo, size=9, max_width=255)
-    c.line(67, H-210, 321, H-210)
-    c.line(358, H-210, 575, H-210)
+    # Raise memo, signature and MICR by 10 pt (~3.5 mm) for Costco stock alignment.
+    txt(25, 194, "MEMO", size=8)
+    txt(68, 194, memo, size=9, max_width=255)
+    c.line(67, H-200, 321, H-200)
+    c.line(358, H-200, 575, H-200)
     if signature_bytes:
         try:
             sig = ImageReader(io.BytesIO(signature_bytes))
             iw, ih = sig.getSize()
             scale = min(160/iw, 34/ih)
             sw, sh = iw*scale, ih*scale
-            c.drawImage(sig, 460-sw/2, H-208, width=sw, height=sh, mask="auto")
+            c.drawImage(sig, 460-sw/2, H-198, width=sw, height=sh, mask="auto")
         except Exception as exc:
             raise ValueError(f"Unable to draw signature image: {exc}") from exc
-    txt(463, 218, "AUTHORIZED SIGNATURE", size=6, align="center")
+    txt(463, 208, "AUTHORIZED SIGNATURE", size=6, align="center")
 
     # MICR must be real E13B, not plain-text substitute. Never silently omit it.
     if not FONT_OK:
@@ -772,7 +773,7 @@ def draw_check(c, payment, account, check_no, transit="A", on_us="C", signature_
     micr = micr_string(check_no, account["Routing Number"], account["Account Number"], transit, on_us)
     if pdfmetrics.stringWidth(micr, "MICR_E13B", 12) > 535:
         raise ValueError("MICR line exceeds printable width; verify account number and font.")
-    txt(38, 244, micr, font="MICR_E13B", size=12)
+    txt(38, 234, micr, font="MICR_E13B", size=12)
 
     # Two stubs below the top check, with cut lines at 3.5 and 7 inches.
     c.setDash(3, 3)
