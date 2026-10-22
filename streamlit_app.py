@@ -651,7 +651,7 @@ def generate_check_pdf(company, account_alias, project, check_no, pay_date, paye
     payment = {"Check Date": pay_date, "Payee": payee, "Amount": Decimal(str(amount)), "Memo": memo}
     out = io.BytesIO()
     c = canvas.Canvas(out, pagesize=letter)
-    c.setTitle("Check layout proof - not negotiable")
+    c.setTitle("Costco Check on Top")
     draw_check(c, payment, info, int(check_no), signature_bytes=signature_bytes)
     c.save()
     return out.getvalue()
@@ -704,33 +704,15 @@ def micr_string(check_no, routing, account_no, transit="A", on_us="C"):
 
 
 def draw_check(c, payment, account, check_no, transit="A", on_us="C", signature_bytes=None):
-    """FreeCheckPrint-inspired US Letter layout; all printed fields are generated anew.
+    """Costco Check-on-Top: 8.5 x 3.5 inch top check, two record stubs.
 
-    Top portion: check; lower portion: record stub. Coordinates use top-left
-    origin to match the supplied reference. This is a watermarked layout proof.
+    Prints all variable details including MICR onto blank check stock. Print at
+    Actual Size / 100%; test alignment and bank scanner compatibility first.
     """
     W, H = letter
-    # Move all printed check content upward by exactly 5 mm (14.17 PDF points).
-    c.saveState()
-    c.translate(0, 5 * 72 / 25.4)
-    def txt(x, top, text, font="Helvetica", size=8, align="left", max_width=None):
-        text = str(text or "")
-        if max_width is not None:
-            while size > 5.5 and pdfmetrics.stringWidth(text, font, size) > max_width:
-                size -= 0.3
-        c.setFont(font, size)
-        y = H - top
-        if align == "right": c.drawRightString(x, y, text)
-        elif align == "center": c.drawCentredString(x, y, text)
-        else: c.drawString(x, y, text)
-
-    def address_lines(raw):
-        raw = str(raw or "").replace("\r", "")
-        return [v.strip() for v in raw.split("\n") if v.strip()][:3]
-
     company = str(account["Company"])
     bank = str(account["Bank Name"])
-    address = address_lines(account.get("Company Address", ""))
+    address = [v.strip() for v in str(account.get("Company Address", "")).replace("\r", "").split("\n") if v.strip()]
     date_text = payment["Check Date"].strftime("%m/%d/%Y")
     payee = str(payment["Payee"])
     amount = payment["Amount"]
@@ -738,100 +720,80 @@ def draw_check(c, payment, account, check_no, transit="A", on_us="C", signature_
     memo = str(payment.get("Memo", "") or "")
     words = amount_words(amount)
 
-    # Header positions and typography closely follow the uploaded 2001 sample.
-    txt(144, 40, company, "Helvetica-Bold", 9.2, "center", 210)
-    for i, line in enumerate(address):
-        txt(144, 54 + i*10, line, size=7.7, align="center", max_width=240)
-    txt(370, 35, bank, "Helvetica-Bold", 7.4, "center", 188)
-    txt(598, 39, check_no, "Courier", 11, "right")
-    txt(555, 73, date_text, "Helvetica", 10, "right")
+    def txt(x, top, value, font="Helvetica", size=9, align="left", max_width=None):
+        value = str(value or "")
+        if max_width:
+            while size > 6 and pdfmetrics.stringWidth(value, font, size) > max_width:
+                size -= .25
+        c.setFont(font, size)
+        y = H - top
+        if align == "right": c.drawRightString(x, y, value)
+        elif align == "center": c.drawCentredString(x, y, value)
+        else: c.drawString(x, y, value)
 
-    txt(13, 99, "PAY TO THE", "Helvetica", 5.4)
-    txt(13, 106, "ORDER OF", "Helvetica", 5.4)
-    txt(72, 105, payee, "Helvetica", 11, max_width=360)
-    txt(476, 105, "$", "Helvetica-Bold", 11)
-    txt(548, 105, f"****{amount_text}", "Helvetica", 10.5, "right", 90)
-    txt(13, 128, "Pay", "Helvetica-Bold", 7.5)
-    # Clip to available width without truncating numeric amount.
-    txt(36, 128, words + "*"*15, "Helvetica", 9.2, max_width=465)
-    txt(602, 128, "DOLLARS", "Helvetica-Bold", 7, "right")
-    txt(602, 148, "VOID 90 DAYS AFTER ISSUE", "Helvetica-Bold", 6.5, "right")
-    # Removed redundant payee name in the middle of the check.
-    c.setLineWidth(.6)
-    c.line(350, H-204, 600, H-204)
+    # Costco-style check area: 612 pt wide x 252 pt tall, at the top of US Letter.
+    # No background, borders, preprinted security patterns, or watermarks.
+    txt(28, 24, company, "Helvetica-Bold", 10.5, max_width=260)
+    for i, line in enumerate(address[:3]):
+        txt(28, 36 + 10*i, line, size=8.3, max_width=270)
+    txt(390, 25, bank, "Helvetica-Bold", 8.5, align="center", max_width=185)
+    txt(579, 27, check_no, "Courier", 11, align="right")
+    txt(578, 61, date_text, size=9.5, align="right")
+
+    txt(25, 97, "PAY TO THE", size=6.5)
+    txt(25, 105, "ORDER OF", size=6.5)
+    txt(91, 103, payee, size=10.5, max_width=385)
+    c.setLineWidth(.45)
+    c.line(90, H-109, 480, H-109)
+    txt(493, 103, "$", "Helvetica-Bold", 11)
+    txt(577, 103, amount_text, size=10.5, align="right", max_width=78)
+    c.line(25, H-132, 562, H-132)
+    txt(29, 129, words, size=9.3, max_width=495)
+    txt(603, 132, "DOLLARS", size=7, align="right")
+
+    txt(25, 204, "MEMO", size=8)
+    txt(68, 204, memo, size=9, max_width=255)
+    c.line(67, H-210, 321, H-210)
+    c.line(358, H-210, 575, H-210)
     if signature_bytes:
         try:
-            signature = ImageReader(io.BytesIO(signature_bytes))
-            image_width, image_height = signature.getSize()
-            # Fit within the signature area without stretching the image.
-            max_width, max_height = 170, 38
-            scale = min(max_width / image_width, max_height / image_height)
-            drawn_width, drawn_height = image_width * scale, image_height * scale
-            c.drawImage(
-                signature,
-                475 - drawn_width / 2,
-                H - 201,
-                width=drawn_width,
-                height=drawn_height,
-                mask="auto",
-            )
+            sig = ImageReader(io.BytesIO(signature_bytes))
+            iw, ih = sig.getSize()
+            scale = min(160/iw, 34/ih)
+            sw, sh = iw*scale, ih*scale
+            c.drawImage(sig, 460-sw/2, H-208, width=sw, height=sh, mask="auto")
         except Exception as exc:
             raise ValueError(f"Unable to draw signature image: {exc}") from exc
-    txt(492, 216, "AUTHORIZED SIGNATURE", "Helvetica", 5.5, "center")
-    txt(13, 211, "MEMO", "Helvetica-Bold", 9)
-    txt(46, 211, memo, "Helvetica", 10, max_width=290)
+    txt(463, 218, "AUTHORIZED SIGNATURE", size=6, align="center")
 
-    # MICR line: mapping and alignment must be validated by the bank/printer.
-    line = micr_string(check_no, account["Routing Number"], account["Account Number"], transit, on_us)
-    if FONT_OK:
-        size = 12
-        while size > 7 and pdfmetrics.stringWidth(line, "MICR_E13B", size) > 400:
-            size -= .25
-        txt(125, 249, line, "MICR_E13B", size)
-    else:
-        txt(125, 249, "MICR FONT MISSING — TEST ONLY", "Helvetica-Bold", 8)
+    # MICR must be real E13B, not plain-text substitute. Never silently omit it.
+    if not FONT_OK:
+        raise ValueError("MICR E13B font missing. Add micr-e13b.ttf before generating checks.")
+    micr = micr_string(check_no, account["Routing Number"], account["Account Number"], transit, on_us)
+    if pdfmetrics.stringWidth(micr, "MICR_E13B", 12) > 535:
+        raise ValueError("MICR line exceeds printable width; verify account number and font.")
+    txt(38, 244, micr, font="MICR_E13B", size=12)
 
-    # Payment stub below the check, aligned like the reference.
-    txt(7, 298, "CHECK NUMBER:", "Helvetica-Bold", 9)
-    txt(97, 298, check_no, "Helvetica", 9)
-    txt(7, 316, "DATE:", "Helvetica-Bold", 9)
-    txt(97, 316, date_text, "Helvetica", 9)
-    txt(7, 334, "PAYEE:", "Helvetica-Bold", 9)
-    txt(97, 334, payee, "Helvetica", 9, max_width=330)
-    txt(7, 352, "AMOUNT:", "Helvetica-Bold", 9)
-    txt(97, 352, "$"+amount_text, "Helvetica", 9)
-    txt(7, 370, "MEMO:", "Helvetica-Bold", 9)
-    txt(97, 370, memo, "Helvetica", 9, max_width=420)
-
-    txt(306, 555, "Keep this copy for your records:", "Helvetica-Bold", 11, "center")
-    # Miniature duplicate; plain black on white, no decorative branding.
-    c.saveState()
-    c.translate(126, H-610)
-    c.scale(.52, .52)
-    # Coordinates in miniature's local space, y goes up.
-    c.setFont("Helvetica-Bold", 8)
-    c.drawString(0, 0, company[:42])
-    c.setFont("Helvetica", 7)
-    for i, line in enumerate(address[:2]):
-        c.drawString(0, -12 - i*10, line[:50])
-    c.setFont("Helvetica-Bold", 8)
-    c.drawString(290, 0, bank[:37])
-    c.drawRightString(820, 0, str(check_no))
-    c.setFont("Helvetica", 8)
-    c.drawString(0, -50, payee[:45])
-    c.drawRightString(820, -50, "$"+amount_text)
-    c.drawString(0, -75, words[:95])
-    c.drawString(0, -112, "MEMO  " + memo[:65])
-    c.line(560, -112, 820, -112)
-    c.setFont("Helvetica-Bold", 10)
-    c.setFillColorRGB(0, 0, 0)
-    c.drawCentredString(410, -155, "COPY — VOID")
-    c.restoreState()
-
-    # No logo, colored background, or diagonal watermark.
-    # A clear non-negotiable notice remains outside the check area.
-    txt(306, 525, "LAYOUT TEST ONLY — NOT NEGOTIABLE", "Helvetica-Bold", 8, "center")
-    c.restoreState()
+    # Two stubs below the top check, with cut lines at 3.5 and 7 inches.
+    c.setDash(3, 3)
+    c.setStrokeColorRGB(.65, .65, .65)
+    c.line(0, H-252, W, H-252)
+    c.line(0, H-504, W, H-504)
+    c.setDash()
+    c.setStrokeColorRGB(0, 0, 0)
+    for offset in (252, 504):
+        txt(28, offset+25, company, "Helvetica-Bold", 10, max_width=280)
+        txt(580, offset+25, f"CHECK #{check_no}", "Helvetica-Bold", 9, "right")
+        txt(28, offset+54, "DATE", "Helvetica-Bold", 8)
+        txt(100, offset+54, date_text, size=9)
+        txt(310, offset+54, "AMOUNT", "Helvetica-Bold", 8)
+        txt(580, offset+54, "$"+amount_text, size=10, align="right")
+        txt(28, offset+82, "PAYEE", "Helvetica-Bold", 8)
+        txt(100, offset+82, payee, size=9, max_width=455)
+        txt(28, offset+111, "MEMO", "Helvetica-Bold", 8)
+        txt(100, offset+111, memo, size=9, max_width=460)
+        txt(28, offset+143, "BANK", "Helvetica-Bold", 8)
+        txt(100, offset+143, bank, size=9, max_width=440)
     c.showPage()
 
 
@@ -1145,7 +1107,7 @@ if mode == "📝 Single Mannul Check":
             }
             account_num = custom_alias.strip() or "Manual Account"
 
-        st.caption("PDF is generated directly; no check template files required.")
+        st.caption("Costco Check on Top layout: prints all fields including MICR on blank stock. Use Actual Size (100%) and verify MICR with your bank before issuing checks.")
 
         st.markdown("---")
 
