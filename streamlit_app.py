@@ -710,7 +710,7 @@ def generate_check_pdf(company, account_alias, project, check_no, pay_date, paye
     payment = {"Check Date": pay_date, "Payee": payee, "Amount": Decimal(str(amount)), "Memo": memo}
     out = io.BytesIO()
     c = canvas.Canvas(out, pagesize=letter)
-    c.setTitle("Moo Development Template" if str(company).strip().casefold() == "moo development llc" else "Costco Check on Top")
+    c.setTitle("Moo Development Template" if str(company).strip().casefold() == "moo development llc" else "Check #1684 Reference Layout")
     if str(company).strip().casefold() == "moo development llc":
         draw_moo_development_check(c, payment, info, int(check_no), signature_bytes=signature_bytes)
     else:
@@ -766,7 +766,7 @@ def micr_string(check_no, routing, account_no, transit="A", on_us="C"):
 
 
 def draw_check(c, payment, account, check_no, transit="A", on_us="C", signature_bytes=None):
-    """Costco Check-on-Top: 8.5 x 3.5 inch top check, two record stubs.
+    """Layout matched to the user-provided Check_1684_626 Plumbing reference: top check + two stubs.
 
     Prints all variable details including MICR onto blank check stock. Print at
     Actual Size / 100%; test alignment and bank scanner compatibility first.
@@ -796,15 +796,15 @@ def draw_check(c, payment, account, check_no, transit="A", on_us="C", signature_
     # Costco-style check area: 612 pt wide x 252 pt tall, at the top of US Letter.
     # No background, borders, preprinted security patterns, or watermarks.
     # Ordinary blank-stock checks require the complete issuer/bank header.
-    txt(25, 28, company, font="Helvetica-Bold", size=11, max_width=330)
+    txt(28, 25, company, font="Helvetica-Bold", size=11, max_width=330)
     for i, line in enumerate(address[:2]):
-        txt(25, 41 + i * 11, line, size=8, max_width=335)
-    txt(578, 28, f"CHECK #{check_no}", font="Helvetica-Bold", size=9, align="right")
-    txt(578, 42, bank, size=8.5, align="right", max_width=205)
-    txt(578, 61, date_text, size=9.5, align="right")
+        txt(28, 37 + i * 10, line, size=8, max_width=335)
+    txt(579, 28, str(check_no), font="Helvetica", size=10, align="right")
+    txt(390, 25, bank, font="Helvetica-Bold", size=9, align="center", max_width=235)
+    txt(578, 60, date_text, size=9.5, align="right")
 
-    txt(25, 97, "PAY TO THE", size=6.5)
-    txt(25, 105, "ORDER OF", size=6.5)
+    txt(25, 96, "PAY TO THE", size=6.5)
+    txt(25, 104, "ORDER OF", size=6.5)
     txt(91, 103, payee, size=10.5, max_width=385)
     c.setLineWidth(.45)
     c.line(90, H-109, 480, H-109)
