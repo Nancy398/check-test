@@ -799,7 +799,9 @@ def draw_check(c, payment, account, check_no, transit="A", on_us="C", signature_
     txt(28, 25, company, font="Helvetica-Bold", size=11, max_width=330)
     for i, line in enumerate(address[:2]):
         txt(28, 37 + i * 10, line, size=8, max_width=335)
-    txt(579, 28, str(check_no), font="Helvetica", size=10, align="right")
+    # Reference Check #1684 uses Courier 11 pt for the upper-right check number.
+    # The bottom MICR line remains MICR_E13B 12 pt, and stubs remain Helvetica-Bold.
+    txt(579, 28, str(check_no), font="Courier", size=11, align="right")
     txt(390, 25, bank, font="Helvetica-Bold", size=9, align="center", max_width=235)
     txt(578, 60, date_text, size=9.5, align="right")
 
