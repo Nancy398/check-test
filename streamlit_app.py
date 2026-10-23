@@ -201,7 +201,7 @@ def validate_weekly_rows(rows, projects):
             errors.append(f"Row {idx+1}: project not matched to Google Sheets")
         else:
             p = projects.loc[projects["Project_Name"] == project].iloc[0]
-            if not str(p.get("Company", "")).strip() or not str(p.get("Account", "")).strip():
+            if not paying_company(p) or not str(p.get("Account", "")).strip():
                 errors.append(f"Row {idx+1}: project missing company or bank account")
     for source, parts in groups.items():
         try:
@@ -212,6 +212,14 @@ def validate_weekly_rows(rows, projects):
         except (InvalidOperation, ValueError):
             errors.append(f"Source {source}: invalid totals")
     return errors
+
+
+def paying_company(project_row):
+    """Company is the project owner; Company_Name is the check issuer."""
+    value = str(project_row.get("Company_Name", "") or "").strip()
+    if value and value.lower() not in ("nan", "none"):
+        return value
+    return str(project_row.get("Company", "") or "").strip()
 
 
 def next_number_for_account(company, account, history, staged, project_starts):
@@ -511,6 +519,9 @@ def load_project_presets():
 
     df_combined = pd.concat([df_p, extra_projects], ignore_index=True)
     df_combined = df_combined.drop_duplicates(subset=["Project_Name"], keep="first")
+    # Preserve project ownership in Company and paying entity in Company_Name.
+    if "Company_Name" not in df_combined.columns:
+        df_combined["Company_Name"] = df_combined.get("Company", "")
     return df_combined
 
 @st.cache_data(ttl=60)
@@ -577,16 +588,17 @@ def bank_from_project(alias, project=""):
     result = bank_registry().get(str(alias), {}).copy()
     if not df_projects.empty and project in df_projects["Project_Name"].values:
         p = df_projects[df_projects["Project_Name"] == project].iloc[0]
-        for dest, candidates in {
+        if str(p.get("Account", "")).strip() == str(alias).strip():
+            for dest, candidates in {
             "Bank Name": ["Bank_Name", "Bank Name"],
             "Routing Number": ["Routing_Number", "Routing Number"],
             "Account Number": ["Account_Number", "Account Number", "Bank_Account_Number"],
-        }.items():
-            if not result.get(dest):
-                for col in candidates:
-                    if str(p.get(col, "")).strip():
-                        result[dest] = str(p[col]).strip()
-                        break
+            }.items():
+                if not result.get(dest):
+                    for col in candidates:
+                        if str(p.get(col, "")).strip():
+                            result[dest] = str(p[col]).strip()
+                            break
     return result
 
 def resolve_bank(alias, project=""):
@@ -651,8 +663,11 @@ def generate_check_pdf(company, account_alias, project, check_no, pay_date, paye
     payment = {"Check Date": pay_date, "Payee": payee, "Amount": Decimal(str(amount)), "Memo": memo}
     out = io.BytesIO()
     c = canvas.Canvas(out, pagesize=letter)
-    c.setTitle("Costco Check on Top")
-    draw_check(c, payment, info, int(check_no), signature_bytes=signature_bytes)
+    c.setTitle("Moo Development Template" if str(company).strip().casefold() == "moo development llc" else "Costco Check on Top")
+    if str(company).strip().casefold() == "moo development llc":
+        draw_moo_development_check(c, payment, info, int(check_no), signature_bytes=signature_bytes)
+    else:
+        draw_check(c, payment, info, int(check_no), signature_bytes=signature_bytes)
     c.save()
     return out.getvalue()
 
@@ -797,6 +812,79 @@ def draw_check(c, payment, account, check_no, transit="A", on_us="C", signature_
         txt(100, offset+143, bank, size=9, max_width=440)
     c.showPage()
 
+
+
+def draw_moo_development_check(c, payment, account, check_no, signature_bytes=None):
+    """Moo Development LLC layout measured from supplied check_run_3738.pdf.
+
+    Draws the values, two stubs, and signature without MICR. The Moo
+    Development check stock already contains its own preprinted MICR line.
+    """
+    W, H = letter
+    date_text = payment["Check Date"].strftime("%m/%d/%Y")
+    payee = str(payment["Payee"])
+    amount = payment["Amount"]
+    amount_text = f"{amount:,.2f}"
+    memo = str(payment.get("Memo", "") or "")
+    words = amount_words(amount)
+    account_no = str(account["Account Number"])
+
+    def txt(x, top, value, font="Helvetica", size=9, align="left", max_width=None):
+        value = str(value or "")
+        if max_width:
+            while size > 6 and pdfmetrics.stringWidth(value, font, size) > max_width:
+                size -= .25
+        c.setFont(font, size)
+        if align == "right": c.drawRightString(x, H-top, value)
+        else: c.drawString(x, H-top, value)
+
+    # Main check. Positions taken from the user's PDF (US Letter, top origin).
+    txt(33, 25, account["Company"], "Helvetica-Bold", 10)
+    for i, line in enumerate(str(account.get("Company Address", "")).splitlines()[:2]):
+        txt(33, 37+10*i, line, size=8)
+    txt(390, 28, account["Bank Name"], "Helvetica-Bold", 8, max_width=160)
+    txt(562, 32, str(check_no), "Courier", 10, "right")
+    txt(524, 65, date_text, size=9)
+    txt(81, 98, payee, size=10, max_width=385)
+    txt(559, 99, "$"+amount_text, "Helvetica-Bold", 10, "right")
+    txt(77, 123, "**** " + words, size=9, max_width=490)
+    txt(54, 190, memo, size=9, max_width=270)
+    c.setLineWidth(.55)
+    c.line(54, H-195, 350, H-195)
+    c.line(385, H-195, 570, H-195)
+    if signature_bytes:
+        try:
+            sig = ImageReader(io.BytesIO(signature_bytes))
+            iw, ih = sig.getSize()
+            scale = min(155/iw, 31/ih)
+            sw, sh = iw*scale, ih*scale
+            c.drawImage(sig, 477-sw/2, H-193, width=sw, height=sh, mask="auto")
+        except Exception as exc:
+            raise ValueError(f"Unable to draw signature image: {exc}") from exc
+    txt(474, 204, "AUTHORIZED SIGNATURE", size=6, align="right")
+
+    # MICR intentionally omitted for Moo Development LLC: preprinted on check stock.
+
+    # Two stubs match the supplied template's field positions and gray table.
+    for offset in (0, 252):
+        txt(18, 277+offset, "Date:", "Helvetica-Bold", 8)
+        txt(45, 277+offset, date_text, size=8)
+        txt(136, 277+offset, f"Check #{check_no}", "Helvetica-Bold", 8)
+        txt(238, 277+offset, "Account:", "Helvetica-Bold", 8)
+        txt(282, 277+offset, account_no, size=8, max_width=230)
+        txt(18, 292+offset, "Pay to:", "Helvetica-Bold", 8)
+        txt(53, 292+offset, payee, size=8, max_width=500)
+        c.setFillColorRGB(.88, .88, .88)
+        c.rect(54, H-(314+offset), 503, 13, fill=1, stroke=0)
+        c.setFillColorRGB(0, 0, 0)
+        txt(60, 311+offset, "Description", size=8)
+        txt(547, 311+offset, "Amount", size=8, align="right")
+        txt(60, 323+offset, memo, size=8, max_width=425)
+        txt(547, 323+offset, "$"+amount_text, size=8, align="right")
+        c.setStrokeColorRGB(.7, .7, .7)
+        c.line(54, H-(326+offset), 557, H-(326+offset))
+        c.setStrokeColorRGB(0, 0, 0)
+    c.showPage()
 
 # 加载云端预设数据
 df_projects = load_project_presets()
@@ -1043,7 +1131,7 @@ if mode == "📝 Single Mannul Check":
                     default_chk_val = latest_check_map.get(selected_proj, 1001)
                     p_info = df_projects[df_projects["Project_Name"] == selected_proj].iloc[0]
                     project_account = str(p_info.get("Account", "ACC-5027")).strip()
-                    project_company = str(p_info.get("Company", "Development Company")).strip()
+                    project_company = paying_company(p_info) or "Development Company"
                 else:
                     project_site = st.text_input("Project Name", value="New Site")
                     default_chk_val = 1001
@@ -1319,7 +1407,7 @@ elif mode == "👷 Construction Bulk Checks":
                 for row in st.session_state.weekly_review_rows:
                     project = str(row["Project"])
                     p = df_projects.loc[df_projects["Project_Name"] == project].iloc[0]
-                    company, account = str(p["Company"]).strip(), str(p["Account"]).strip()
+                    company, account = paying_company(p), str(p["Account"]).strip()
                     # Bank aliases must be configured; never silently substitute an unrelated account.
                     ensure_bank(account, project)
                     start = proj_start_nums.get(project, 1001)
@@ -1497,7 +1585,7 @@ elif mode == "👷 Construction Bulk Checks":
             if add_comp_type == "Development Company":
                 if not df_projects.empty and final_project_val in df_projects["Project_Name"].values:
                     p_row_info = df_projects[df_projects["Project_Name"] == final_project_val].iloc[0]
-                    final_company_val = str(p_row_info.get("Company", "Development Company")).strip()
+                    final_company_val = paying_company(p_row_info) or "Development Company"
                 else:
                     final_company_val = "Development Company"
             else:
@@ -1608,8 +1696,8 @@ elif mode == "👷 Construction Bulk Checks":
                 p_info = proj_map.get(project_name, {"Account": "ACC-8652", "Company": "Development Company"})
                 
                 company_name = str(row.get("Company", "")).strip()
-                if not company_name or company_name == "Development Company":
-                    company_name = str(p_info.get("Company", "Development Company")).strip()
+                if not company_name or company_name == "Development Company" or company_name == str(p_info.get("Company", "")).strip():
+                    company_name = paying_company(p_info) or "Development Company"
                 
                 if company_name == "Moo Construction":
                     account_num = "Chase-1185"
