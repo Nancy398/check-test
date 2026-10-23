@@ -585,20 +585,42 @@ def bank_registry():
     return registry
 
 def bank_from_project(alias, project=""):
-    result = bank_registry().get(str(alias), {}).copy()
-    if not df_projects.empty and project in df_projects["Project_Name"].values:
-        p = df_projects[df_projects["Project_Name"] == project].iloc[0]
-        if str(p.get("Account", "")).strip() == str(alias).strip():
-            for dest, candidates in {
-            "Bank Name": ["Bank_Name", "Bank Name"],
-            "Routing Number": ["Routing_Number", "Routing Number"],
-            "Account Number": ["Account_Number", "Account Number", "Bank_Account_Number"],
-            }.items():
-                if not result.get(dest):
-                    for col in candidates:
-                        if str(p.get(col, "")).strip():
-                            result[dest] = str(p[col]).strip()
-                            break
+    """Find bank details by Account across the whole Project sheet, not just one project.
+
+    Precedence: Streamlit Secrets BANK_ACCOUNTS, then Project sheet fields.
+    Never silently use bank information belonging to a different account.
+    """
+    alias = str(alias).strip()
+    result = bank_registry().get(alias, {}).copy()
+    if df_projects.empty or "Account" not in df_projects.columns:
+        return result
+
+    matches = df_projects.loc[
+        df_projects["Account"].fillna("").astype(str).str.strip() == alias
+    ]
+    fields = {
+        "Bank Name": ("Bank_Name", "Bank Name"),
+        "Routing Number": ("Routing_Number", "Routing Number"),
+        "Account Number": ("Account_Number", "Account Number", "Bank_Account_Number"),
+    }
+    for dest, columns in fields.items():
+        if str(result.get(dest, "")).strip():
+            continue
+        values = set()
+        for _, row in matches.iterrows():
+            for col in columns:
+                if col in matches.columns:
+                    value = str(row.get(col, "")).strip()
+                    if value and value.casefold() not in ("nan", "none"):
+                        values.add(value)
+                        break
+        if len(values) > 1:
+            raise ValueError(
+                f"Account {alias}: conflicting {dest} values in the Project sheet. "
+                "Please correct the rows for this account before printing."
+            )
+        if values:
+            result[dest] = next(iter(values))
     return result
 
 def resolve_bank(alias, project=""):
@@ -611,7 +633,7 @@ def ensure_bank(alias, project=""):
     bank = resolve_bank(alias, project)
     missing = [k for k in ["Bank Name", "Routing Number", "Account Number"] if not bank.get(k)]
     if missing:
-        raise ValueError(f"Account {alias}: missing {', '.join(missing)}. Configure in sidebar or Streamlit Secrets.")
+        raise ValueError(f"Account {alias}: missing {', '.join(missing)}. Add Bank_Name, Routing_Number and Account_Number to a Project sheet row with this Account, or configure sidebar / Streamlit Secrets.")
     routing = str(bank["Routing Number"]).strip()
     acct = str(bank["Account Number"]).strip()
     if not re.fullmatch(r"\d{9}", routing):
