@@ -518,7 +518,29 @@ def load_project_presets():
         return extra_projects
 
     df_combined = pd.concat([df_p, extra_projects], ignore_index=True)
-    df_combined = df_combined.drop_duplicates(subset=["Project_Name"], keep="first")
+    # Preserve bank details from all rows, including duplicate project names.
+    # Backfill missing bank fields from other rows with the same Account.
+    bank_cols = ["Bank_Name", "Routing_Number", "Account_Number"]
+    for col in bank_cols:
+        if col not in df_combined.columns:
+            df_combined[col] = ""
+        df_combined[col] = df_combined[col].fillna("").astype(str).str.strip()
+    if "Account" in df_combined.columns:
+        df_combined["Account"] = df_combined["Account"].fillna("").astype(str).str.strip()
+        for account, group in df_combined.groupby("Account"):
+            if not account:
+                continue
+            for col in bank_cols:
+                values = {v for v in group[col] if v and v.casefold() not in ("nan", "none")}
+                if len(values) == 1:
+                    df_combined.loc[(df_combined["Account"] == account) & (df_combined[col] == ""), col] = next(iter(values))
+    # Prefer the most complete row for a duplicate project.
+    df_combined["_bank_fields_filled"] = df_combined[bank_cols].apply(
+        lambda row: sum(bool(v and v.casefold() not in ("nan", "none")) for v in row), axis=1
+    )
+    df_combined = (df_combined.sort_values("_bank_fields_filled", ascending=False, kind="stable")
+                   .drop_duplicates(subset=["Project_Name"], keep="first")
+                   .drop(columns=["_bank_fields_filled"]))
     # Preserve project ownership in Company and paying entity in Company_Name.
     if "Company_Name" not in df_combined.columns:
         df_combined["Company_Name"] = df_combined.get("Company", "")
@@ -595,8 +617,11 @@ def bank_from_project(alias, project=""):
     if df_projects.empty or "Account" not in df_projects.columns:
         return result
 
-    matches = df_projects.loc[
-        df_projects["Account"].fillna("").astype(str).str.strip() == alias
+    # Read the complete Project sheet so duplicate project names cannot hide bank fields.
+    raw_projects = read_file(GS_SPREADSHEET_NAME, "Project")
+    source = raw_projects if not raw_projects.empty and "Account" in raw_projects.columns else df_projects
+    matches = source.loc[
+        source["Account"].fillna("").astype(str).str.strip() == alias
     ]
     fields = {
         "Bank Name": ("Bank_Name", "Bank Name"),
@@ -770,7 +795,12 @@ def draw_check(c, payment, account, check_no, transit="A", on_us="C", signature_
 
     # Costco-style check area: 612 pt wide x 252 pt tall, at the top of US Letter.
     # No background, borders, preprinted security patterns, or watermarks.
-    # Header is intentionally blank: no company, bank, address or check number.
+    # Ordinary blank-stock checks require the complete issuer/bank header.
+    txt(25, 28, company, font="Helvetica-Bold", size=11, max_width=330)
+    for i, line in enumerate(address[:2]):
+        txt(25, 41 + i * 11, line, size=8, max_width=335)
+    txt(578, 28, f"CHECK #{check_no}", font="Helvetica-Bold", size=9, align="right")
+    txt(578, 42, bank, size=8.5, align="right", max_width=205)
     txt(578, 61, date_text, size=9.5, align="right")
 
     txt(25, 97, "PAY TO THE", size=6.5)
