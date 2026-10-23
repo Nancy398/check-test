@@ -847,7 +847,6 @@ def draw_moo_development_check(c, payment, account, check_no, signature_bytes=No
     txt(54, 190, memo, size=9, max_width=270)
     c.setLineWidth(.55)
     c.line(54, H-195, 350, H-195)
-    c.line(385, H-195, 570, H-195)
     if signature_bytes:
         try:
             sig = ImageReader(io.BytesIO(signature_bytes))
@@ -857,7 +856,6 @@ def draw_moo_development_check(c, payment, account, check_no, signature_bytes=No
             c.drawImage(sig, 477-sw/2, H-193, width=sw, height=sh, mask="auto")
         except Exception as exc:
             raise ValueError(f"Unable to draw signature image: {exc}") from exc
-    txt(474, 204, "AUTHORIZED SIGNATURE", size=6, align="right")
 
     # MICR intentionally omitted for Moo Development LLC: preprinted on check stock.
 
