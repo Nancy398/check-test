@@ -817,6 +817,10 @@ def draw_moo_development_check(c, payment, account, check_no, signature_bytes=No
     Development check stock already contains its own preprinted MICR line.
     """
     W, H = letter
+    # Shift only Moo Development LLC printed content DOWN by 3 mm.
+    # Change this value to fine-tune alignment with the preprinted stock.
+    MOO_VERTICAL_SHIFT_MM = 3.0
+    c.translate(0, -MOO_VERTICAL_SHIFT_MM * 72 / 25.4)
     date_text = payment["Check Date"].strftime("%m/%d/%Y")
     payee = str(payment["Payee"])
     amount = payment["Amount"]
