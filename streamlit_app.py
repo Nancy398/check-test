@@ -531,6 +531,11 @@ def load_project_presets():
                 values = {v for v in group[col] if v and v.casefold() not in ("nan", "none")}
                 if len(values) == 1:
                     df_combined.loc[(df_combined["Account"] == account) & (df_combined[col] == ""), col] = next(iter(values))
+    # Rows with Company_Name but no Project_Name are payer/bank profiles,
+    # not selectable construction projects. Keep them for account lookup.
+    if "Project_Name" not in df_combined.columns:
+        df_combined["Project_Name"] = ""
+    df_combined["Project_Name"] = df_combined["Project_Name"].fillna("").astype(str).str.strip()
     # Prefer the most complete row for a duplicate project.
     df_combined["_bank_fields_filled"] = df_combined[bank_cols].apply(
         lambda row: sum(bool(v and v.casefold() not in ("nan", "none")) for v in row), axis=1
@@ -937,7 +942,20 @@ df_workers = load_worker_presets()
 df_stages = load_stage_presets()
 
 preset_worker_list = df_workers["Worker_Name"].dropna().tolist() if not df_workers.empty else []
-preset_project_list = df_projects["Project_Name"].dropna().tolist() if not df_projects.empty else []
+preset_project_list = [v for v in df_projects["Project_Name"].dropna().astype(str).str.strip().tolist() if v and v.casefold() not in ("nan", "none")] if not df_projects.empty else []
+
+def payer_profile(name):
+    """Look up a paying entity by Company_Name, even without Project_Name/Company."""
+    if df_projects.empty or "Company_Name" not in df_projects.columns:
+        return None
+    matches = df_projects.loc[df_projects["Company_Name"].fillna("").astype(str).str.strip().str.casefold() == name.casefold()]
+    if matches.empty:
+        return None
+    # Prefer a row containing a complete account/bank profile.
+    fields = [c for c in ("Account", "Bank_Name", "Routing_Number", "Account_Number") if c in matches.columns]
+    ranked = matches.assign(_filled=matches[fields].fillna("").astype(str).apply(lambda r: sum(bool(v.strip()) for v in r), axis=1))
+    return ranked.sort_values("_filled", ascending=False, kind="stable").iloc[0]
+
 
 check_history = read_file(GS_SPREADSHEET_NAME, GS_WORKSHEET_NAME)
 all_account_aliases = sorted(set(df_projects["Account"].dropna().astype(str).str.strip()) if "Account" in df_projects.columns else set())
@@ -945,7 +963,7 @@ all_account_aliases = sorted(set(df_projects["Account"].dropna().astype(str).str
 # Moo Housing retains its legacy ACC-* choices independently.
 all_account_aliases = [a for a in all_account_aliases if a and a.casefold() not in ("nan", "none")]
 moo_housing_aliases = ["ACC-8652", "ACC-3738"]
-all_numbering_accounts = sorted(set(all_account_aliases) | set(moo_housing_aliases) | {"Chase-1185"})
+all_numbering_accounts = sorted(set(all_account_aliases) | set(moo_housing_aliases))
 latest_check_map = {alias: next_number_for_account(alias, check_history) for alias in all_numbering_accounts}
 
 # ----------------- 通用 Stage 联动选择组件 (升级支持强制控制 UI) -----------------
@@ -1029,8 +1047,8 @@ def number_to_words_usd(amount):
 
 # Real bank routing/account data must be supplied separately from internal aliases.
 st.sidebar.markdown("### Bank account details")
-st.sidebar.caption("ACC-8652 / Chase-1185 are internal aliases, not MICR account numbers.")
-known_aliases = {"ACC-8652", "ACC-3738", "Chase-1185"}
+st.sidebar.caption("Moo Housing ACC-* labels are internal aliases; Construction accounts come from the Project sheet.")
+known_aliases = {"ACC-8652", "ACC-3738"}
 if not df_projects.empty and "Account" in df_projects.columns:
     known_aliases.update(str(x).strip() for x in df_projects["Account"].dropna() if str(x).strip())
 chosen_alias = st.sidebar.selectbox("Account alias", sorted(known_aliases))
@@ -1199,9 +1217,13 @@ if mode == "📝 Single Mannul Check":
             )
         
             if payer_entity == "Moo Construction":
-                company_name = "Moo Construction"
-                account_num = "Chase-1185"
-                st.info("💡 **Moo Construction** 付款账户已自动固定为: `Chase-1185`")
+                moo_profile = payer_profile("MOO CONSTRUCTION")
+                company_name = str(moo_profile.get("Company_Name", "MOO CONSTRUCTION")).strip() if moo_profile is not None else "MOO CONSTRUCTION"
+                account_num = str(moo_profile.get("Account", "")).strip() if moo_profile is not None else ""
+                if not account_num:
+                    st.error("Project sheet: MOO CONSTRUCTION row needs an Account value.")
+                else:
+                    st.info(f"💡 Moo Construction matched by Company_Name → Account: `{account_num}`")
             else:
                 company_name = project_company
                 account_num = project_account
@@ -1224,7 +1246,7 @@ if mode == "📝 Single Mannul Check":
             payee_name = st.text_input("Payee Name", value="", placeholder="Enter payee full name")
 
         # For no-project checks, select the paying account independently of Project.
-        if main_category == "🏗 Construction" and not project_site:
+        if main_category == "🏗 Construction" and not project_site and payer_entity != "Moo Construction":
             account_num = st.selectbox("Bank Account (required)", all_account_aliases or [""],
                                        index=all_account_aliases.index(account_num) if account_num in all_account_aliases else 0,
                                        key="single_no_project_account")
@@ -1530,7 +1552,8 @@ elif mode == "👷 Construction Bulk Checks":
         selected_p = st.session_state.get("input_p", "")
 
         if c_type == "Moo Construction":
-            st.session_state.input_acc = "Chase-1185"
+            profile = payer_profile("MOO CONSTRUCTION")
+            st.session_state.input_acc = str(profile.get("Account", "")).strip() if profile is not None else ""
         elif c_type == "Moo Housing":
             st.session_state.input_acc = "ACC-8652"
         else:
@@ -1774,8 +1797,9 @@ elif mode == "👷 Construction Bulk Checks":
                 if not company_name or company_name == "Development Company" or company_name == str(p_info.get("Company", "")).strip():
                     company_name = paying_company(p_info) or "Development Company"
                 
-                if company_name == "Moo Construction":
-                    account_num = "Chase-1185"
+                if company_name.strip().casefold() == "moo construction":
+                    profile = payer_profile("MOO CONSTRUCTION")
+                    account_num = str(profile.get("Account", "")).strip() if profile is not None else ""
                 elif company_name == "Moo Housing":
                     account_num = str(row.get("Account", "")).strip() or "ACC-8652"
                 else:
