@@ -748,11 +748,7 @@ def draw_check(c, payment, account, check_no, transit="A", on_us="C", signature_
 
     # Costco-style check area: 612 pt wide x 252 pt tall, at the top of US Letter.
     # No background, borders, preprinted security patterns, or watermarks.
-    txt(28, 24, company, "Helvetica-Bold", 10.5, max_width=260)
-    for i, line in enumerate(address[:3]):
-        txt(28, 36 + 10*i, line, size=8.3, max_width=270)
-    txt(390, 25, bank, "Helvetica-Bold", 8.5, align="center", max_width=185)
-    txt(579, 27, check_no, "Courier", 11, align="right")
+    # Header is intentionally blank: no company, bank, address or check number.
     txt(578, 61, date_text, size=9.5, align="right")
 
     txt(25, 97, "PAY TO THE", size=6.5)
@@ -839,11 +835,7 @@ def draw_moo_development_check(c, payment, account, check_no, signature_bytes=No
         else: c.drawString(x, H-top, value)
 
     # Main check. Positions taken from the user's PDF (US Letter, top origin).
-    txt(33, 25, account["Company"], "Helvetica-Bold", 10)
-    for i, line in enumerate(str(account.get("Company Address", "")).splitlines()[:2]):
-        txt(33, 37+10*i, line, size=8)
-    txt(390, 28, account["Bank Name"], "Helvetica-Bold", 8, max_width=160)
-    txt(562, 32, str(check_no), "Courier", 10, "right")
+    # Header is intentionally blank: no company, bank, address or check number.
     txt(524, 65, date_text, size=9)
     txt(81, 98, payee, size=10, max_width=385)
     txt(559, 99, "$"+amount_text, "Helvetica-Bold", 10, "right")
