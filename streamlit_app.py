@@ -222,13 +222,27 @@ def paying_company(project_row):
     return str(project_row.get("Company", "") or "").strip()
 
 
-def next_number_for_account(company, account, history, staged, project_starts):
+def next_number_for_account(account, history, staged=None, start=1001):
+    """Account is the sole check-number sequence key, across all companies/projects."""
+    account = str(account).strip()
     nums = []
-    if not history.empty and {"Company", "Account", "Check Number"}.issubset(history.columns):
-        matching = history[(history["Company"].astype(str) == company) & (history["Account"].astype(str) == account)]
+    if history is not None and not history.empty and {"Account", "Check Number"}.issubset(history.columns):
+        matching = history.loc[history["Account"].fillna("").astype(str).str.strip() == account]
         nums.extend(pd.to_numeric(matching["Check Number"], errors="coerce").dropna().astype(int).tolist())
-    nums.extend(int(r.get("Check #", 0)) for r in staged if str(r.get("Company", "")) == company and str(r.get("Account", "")) == account)
-    return max(nums, default=int(project_starts)) + 1 if nums else int(project_starts)
+    for row in (staged or []):
+        if str(row.get("Account", "")).strip() == account:
+            try:
+                nums.append(int(row.get("Check #", 0)))
+            except (ValueError, TypeError):
+                pass
+    return max(max(nums) + 1, int(start)) if nums else int(start)
+
+
+def used_numbers_for_account(account, history):
+    if history is None or history.empty or not {"Account", "Check Number"}.issubset(history.columns):
+        return set()
+    matching = history.loc[history["Account"].fillna("").astype(str).str.strip() == str(account).strip()]
+    return set(pd.to_numeric(matching["Check Number"], errors="coerce").dropna().astype(int))
 
 
 # ----------------- 页面配置 -----------------
@@ -356,7 +370,7 @@ def upload_merged_pdfs_to_drive(merged_pdfs, issue_date, check_numbers_by_accoun
     return urls
 
 
-def upload_all_checks_pdf_to_drive(pdf_data, issue_date, records):
+def upload_all_checks_pdf_to_drive(pdf_data, issue_date, records, filename_label="All_Companies"):
     """Upload one complete bulk PDF to the Checks root folder."""
     root_folder_id = str(st.secrets.get("CHECK_PDF_DRIVE_FOLDER_ID", "")).strip()
     if not root_folder_id:
@@ -368,7 +382,7 @@ def upload_all_checks_pdf_to_drive(pdf_data, issue_date, records):
         creds_dict, scopes=["https://www.googleapis.com/auth/drive"]
     )
     service = build("drive", "v3", credentials=credentials, cache_discovery=False)
-    filename = f"{issue_date.strftime('%Y-%m-%d')}_All_Companies_{len(records)}_Checks.pdf"
+    filename = f"{issue_date.strftime('%Y-%m-%d')}_{filename_label}_{len(records)}_Checks.pdf"
     media = MediaIoBaseUpload(io.BytesIO(pdf_data), mimetype="application/pdf", resumable=False)
     uploaded = service.files().create(
         body={"name": filename, "parents": [root_folder_id]},
@@ -470,25 +484,11 @@ def format_check_memo(project, detail):
 
 
 # ----------------- 4. 计算最新可用支票号 -----------------
-def fetch_next_check_numbers_from_gs(df_p_list, default_start_number=1001):
-    next_numbers = {}
-    try:
-        df_gs = read_file(GS_SPREADSHEET_NAME, GS_WORKSHEET_NAME)
-        if not df_gs.empty and "Project" in df_gs.columns and "Check Number" in df_gs.columns:
-            df_gs["Check Number"] = pd.to_numeric(df_gs["Check Number"], errors="coerce")
-            max_checks = df_gs.groupby("Project")["Check Number"].max().to_dict()
-            
-            for p_name in df_p_list:
-                if p_name in max_checks and pd.notnull(max_checks[p_name]):
-                    next_numbers[p_name] = int(max_checks[p_name]) + 1
-    except Exception as e:
-        st.sidebar.warning(f"⚠ 读取云端历史推算支票号失败，将使用默认起始号。({e})")
-
-    for p_name in df_p_list:
-        if p_name not in next_numbers:
-            next_numbers[p_name] = default_start_number
-            
-    return next_numbers
+def fetch_next_check_numbers_from_gs(accounts, default_start_number=1001):
+    """Fetch next check number keyed by Account, never by Project or Company."""
+    history = read_file(GS_SPREADSHEET_NAME, GS_WORKSHEET_NAME)
+    return {str(account).strip(): next_number_for_account(str(account).strip(), history, start=default_start_number)
+            for account in accounts if str(account).strip()}
 
 # ----------------- 5. 自动匹配 Stage 的拦截逻辑 -----------------
 def auto_match_stage(worker_name, project_name, default_stg, default_stg_name, default_sub):
@@ -888,7 +888,10 @@ df_stages = load_stage_presets()
 preset_worker_list = df_workers["Worker_Name"].dropna().tolist() if not df_workers.empty else []
 preset_project_list = df_projects["Project_Name"].dropna().tolist() if not df_projects.empty else []
 
-latest_check_map = fetch_next_check_numbers_from_gs(preset_project_list)
+check_history = read_file(GS_SPREADSHEET_NAME, GS_WORKSHEET_NAME)
+all_account_aliases = sorted(set(df_projects["Account"].dropna().astype(str).str.strip()) if "Account" in df_projects.columns else set())
+all_account_aliases = sorted(set(all_account_aliases) | {"ACC-8652", "ACC-3738", "ACC-5027", "Chase-1185"})
+latest_check_map = {alias: next_number_for_account(alias, check_history) for alias in all_account_aliases}
 
 # ----------------- 通用 Stage 联动选择组件 (升级支持强制控制 UI) -----------------
 def render_stage_selector(key_prefix="default", default_stage="", default_stage_name="", default_sub_stage=""):
@@ -1049,7 +1052,7 @@ if mode == "📝 Single Mannul Check":
 
         # 分支 1：Construction 逻辑
         if main_category == "🏗 Construction":
-            project_options = preset_project_list + ["+ New Project"]
+            project_options = ["No Project / Custom Memo"] + preset_project_list + ["+ New Project"]
             
             # 定义回调函数：当选择 Project 或 Payee 发生变化时，强行改变 Stage 下拉框的值
             def update_single_check_stage():
@@ -1108,7 +1111,6 @@ if mode == "📝 Single Mannul Check":
                 # 如果是 Valente Herrera，无需选择 Project
                 selected_proj = "None (Salary)"
                 project_site = "N/A"
-                default_chk_val = 1001
                 project_account = "ACC-5027"
                 project_company = "Development Company"
                 st.warning("⚠ **Valente Herrera** 默认为内部固定薪资发薪（Salary），不关联任何具体施工项目。")
@@ -1120,15 +1122,17 @@ if mode == "📝 Single Mannul Check":
                     on_change=update_single_check_stage
                 )
         
-                if selected_proj != "+ New Project":
+                if selected_proj == "No Project / Custom Memo":
+                    project_site = ""
+                    project_account = "ACC-5027"
+                    project_company = "Development Company"
+                elif selected_proj != "+ New Project":
                     project_site = selected_proj
-                    default_chk_val = latest_check_map.get(selected_proj, 1001)
                     p_info = df_projects[df_projects["Project_Name"] == selected_proj].iloc[0]
                     project_account = str(p_info.get("Account", "ACC-5027")).strip()
                     project_company = paying_company(p_info) or "Development Company"
                 else:
                     project_site = st.text_input("Project Name", value="New Site")
-                    default_chk_val = 1001
                     project_account = "ACC-5027"
                     project_company = "Development Company"
         
@@ -1153,7 +1157,7 @@ if mode == "📝 Single Mannul Check":
             payer_entity = "Moo Housing"
             company_name = "Moo Housing Inc"
             project_site = "Moo Housing"
-            default_chk_val = latest_check_map.get("Moo Housing", 1001)
+            # Check number is calculated after the final Account is selected.
 
             moo_acc_options = ["ACC-8652", "ACC-3738", "Other"]
             acc_choice = st.selectbox("Bank Account Choice", moo_acc_options, index=0)
@@ -1164,7 +1168,17 @@ if mode == "📝 Single Mannul Check":
 
             payee_name = st.text_input("Payee Name", value="", placeholder="Enter payee full name")
 
-        company_display = st.text_input("Company Display Name", value=company_name)
+        # For no-project checks, select the paying account independently of Project.
+        if main_category == "🏗 Construction" and not project_site:
+            account_num = st.selectbox("Bank Account (required)", all_account_aliases,
+                                       index=all_account_aliases.index(account_num) if account_num in all_account_aliases else 0,
+                                       key="single_no_project_account")
+            matching_rows = df_projects.loc[df_projects["Account"].astype(str).str.strip() == account_num] if "Account" in df_projects.columns else pd.DataFrame()
+            if not matching_rows.empty and payer_entity != "Moo Construction":
+                issuers = sorted(set(paying_company(row) for _, row in matching_rows.iterrows() if paying_company(row)))
+                if issuers:
+                    company_name = st.selectbox("Company_Name (check issuer)", issuers, key="single_no_project_company")
+        company_display = st.text_input("Company Display Name", value=company_name, key=f"company_display_{company_name}")
 
         st.markdown("##### Bank Information")
         manual_bank_mode = st.checkbox(
@@ -1192,6 +1206,8 @@ if mode == "📝 Single Mannul Check":
 
         st.caption("Costco Check on Top layout: prints all fields including MICR on blank stock. Use Actual Size (100%) and verify MICR with your bank before issuing checks.")
 
+        # Numbering follows the final Account, including a manually entered account label.
+        default_chk_val = next_number_for_account(account_num, check_history)
         st.markdown("---")
 
         if main_category == "🏠 Moo Housing":
@@ -1202,19 +1218,22 @@ if mode == "📝 Single Mannul Check":
                 payee_name, project_site, def_stg, def_stg_name, def_sub_stg
             )
 
-            st.markdown("##### 🏗 工程阶段 (Stage Selection)")
-            st_code, st_name, sub1, sub2 = render_stage_selector(
+            if not project_site:
+                selected_stage_str = ""
+                default_memo_text = ""
+            else:
+                st.markdown("##### 🏗 工程阶段 (Stage Selection)")
+                st_code, st_name, sub1, sub2 = render_stage_selector(
                 key_prefix="single_check",
                 default_stage=def_stg,
                 default_stage_name=def_stg_name,
-                default_sub_stage=def_sub_stg
-            )
-            sub_str = f"{sub1}, {sub2}" if sub2 else sub1
-            selected_stage_str = f"{st_code} ({sub_str})" if st_code else ""
+                    default_sub_stage=def_sub_stg
+                )
+                sub_str = f"{sub1}, {sub2}" if sub2 else sub1
+                selected_stage_str = f"{st_code} ({sub_str})" if st_code else ""
+                default_memo_text = f"{st_name} - {sub1}" if sub1 else st_name
 
-            default_memo_text = f"{st_name} - {sub1}" if sub1 else st_name
-
-        user_memo = st.text_input("Memo Detail", value=default_memo_text)
+        user_memo = st.text_input("Memo Detail", value=default_memo_text, key=f"single_memo_{project_site or 'custom'}")
 
         pay_amount = st.number_input("Amount", min_value=0.01, value=1500.00, step=100.0)
 
@@ -1227,7 +1246,8 @@ if mode == "📝 Single Mannul Check":
                 min_value=1,
                 value=int(default_chk_val),
                 step=1,
-                help="Automatically generated by System"
+                key=f"single_check_number_{account_num}",
+                help="Next check number for this Account (editable)"
             )
 
         if main_category == "🏠 Moo Housing":
@@ -1240,6 +1260,9 @@ if mode == "📝 Single Mannul Check":
             else:
                 memo_text = user_memo.strip()
 
+        number_already_used = int(check_num) in used_numbers_for_account(account_num, check_history)
+        if number_already_used:
+            st.error(f"Check #{check_num} has already been issued for Account {account_num}. Choose an unused number.")
         amount_words_text = number_to_words_usd(pay_amount)
 
     try:
@@ -1266,6 +1289,10 @@ if mode == "📝 Single Mannul Check":
 
         def handle_sync_and_download():
             """Archive the single-check PDF first, then save its Drive link to history."""
+            fresh_history = read_file(GS_SPREADSHEET_NAME, GS_WORKSHEET_NAME)
+            if int(check_num) in used_numbers_for_account(account_num, fresh_history):
+                st.session_state["sync_error_msg"] = f"Check #{check_num} already exists for Account {account_num}; nothing was saved."
+                return
             record = [{
                 "Check Number": int(check_num),
                 "Issue Date": pay_date.strftime("%Y-%m-%d"),
@@ -1305,7 +1332,7 @@ if mode == "📝 Single Mannul Check":
         st.download_button(
             label=f"🚀 Save to Drive & Sheets + Download PDF (#{check_num})",
             data=filled_pdf or b"",
-            disabled=filled_pdf is None,
+            disabled=filled_pdf is None or number_already_used,
             file_name=f"Check_{check_num}_{payee_name}.pdf",
             mime="application/pdf",
             type="primary",
@@ -1334,18 +1361,14 @@ elif mode == "👷 Construction Bulk Checks":
     # ----------------- 1. 确认各项目起始支票号 -----------------
     st.subheader("1. Confirm the start check number")
 
-    proj_start_nums = {}
-    cols = st.columns(min(max(len(df_projects), 1), 4))
-    for idx, p_row in df_projects.iterrows():
-        p_name = p_row["Project_Name"]
-        default_num = latest_check_map.get(p_name, 1001)
+    account_start_nums = {}
+    cols = st.columns(min(max(len(all_account_aliases), 1), 4))
+    for idx, alias in enumerate(all_account_aliases):
         with cols[idx % 4]:
-            proj_start_nums[p_name] = st.number_input(
-                f"🏗 {p_name}",
-                min_value=1,
-                value=int(default_num),
-                key=f"start_num_{p_name}"
-            )
+            account_start_nums[alias] = st.number_input(
+                f"🏦 {alias}", min_value=1,
+                value=int(latest_check_map.get(alias, 1001)),
+                key=f"start_num_account_{alias}")
 
     st.markdown("---")
 
@@ -1404,8 +1427,8 @@ elif mode == "👷 Construction Bulk Checks":
                     company, account = paying_company(p), str(p["Account"]).strip()
                     # Bank aliases must be configured; never silently substitute an unrelated account.
                     ensure_bank(account, project)
-                    start = proj_start_nums.get(project, 1001)
-                    number = next_number_for_account(company, account, history, staged, start)
+                    start = account_start_nums.get(account, 1001)
+                    number = next_number_for_account(account, history, staged, start)
                     # Use the latest saved Stage for this worker/project; users can
                     # override Stage and Memo in the final Review & Edit table.
                     prior_stage = latest_stage_for_worker(history, row["Payee"], project)
@@ -1563,16 +1586,9 @@ elif mode == "👷 Construction Bulk Checks":
         if st.button("➕ Add", type="primary", use_container_width=True):
             final_project_val = "" if add_worker == "Valente Herrera" else add_proj
 
-            existing_checks = [
-                row["Check #"] 
-                for row in st.session_state.payroll_list 
-                if row["Project"] == final_project_val
-            ]
-            
-            if existing_checks:
-                next_chk = max(existing_checks) + 1
-            else:
-                next_chk = proj_start_nums.get(final_project_val, 1001)
+            history = read_file(GS_SPREADSHEET_NAME, GS_WORKSHEET_NAME)
+            next_chk = next_number_for_account(add_account, history, st.session_state.payroll_list,
+                                                account_start_nums.get(add_account, 1001))
 
             stage_val_str = f"{st_code} ({f'{sub1}, {sub2}' if sub2 else sub1})" if st_code else ""
 
@@ -1655,10 +1671,20 @@ elif mode == "👷 Construction Bulk Checks":
 
     # ----------------- 4. 批量生成与导出 -----------------
     if not df_payroll_input.empty:
-        duplicates = df_payroll_input.duplicated(subset=["Company", "Account", "Check #"], keep=False)
+        duplicates = df_payroll_input.assign(_account=df_payroll_input["Account"].astype(str).str.strip()).duplicated(subset=["_account", "Check #"], keep=False)
         if duplicates.any():
-            st.error("Duplicate Check Numbers for the same Company / Account. Edit them before generating checks.")
-        if st.button(f"🚀 Confirm & Batch Generate {len(df_payroll_input)} Checks", type="primary", use_container_width=True, disabled=bool(duplicates.any())):
+            st.error("Duplicate Check Numbers for the same Account. Edit them before generating checks.")
+        current_history = read_file(GS_SPREADSHEET_NAME, GS_WORKSHEET_NAME)
+        history_collisions = [(str(r["Account"]), int(r["Check #"])) for _, r in df_payroll_input.iterrows()
+                              if pd.notna(r["Check #"]) and int(r["Check #"]) in used_numbers_for_account(r["Account"], current_history)]
+        if history_collisions:
+            st.error(f"Already issued check numbers (Account, Check #): {history_collisions[:10]}")
+        if st.button(f"🚀 Confirm & Batch Generate {len(df_payroll_input)} Checks", type="primary", use_container_width=True, disabled=bool(duplicates.any()) or bool(history_collisions)):
+            fresh_history = read_file(GS_SPREADSHEET_NAME, GS_WORKSHEET_NAME)
+            if any(int(r["Check #"]) in used_numbers_for_account(r["Account"], fresh_history)
+                   for _, r in df_payroll_input.iterrows()):
+                st.error("A check number has already been issued for its Account. Refresh and re-number before continuing.")
+                st.stop()
             account_pdf_dict = {}
             records_log = []
     
@@ -1736,40 +1762,63 @@ elif mode == "👷 Construction Bulk Checks":
                 })
     
             if records_log:
-                # Combine all checks into ONE PDF. Sort by company/account/check number
-                # so different bank accounts remain clearly grouped for printing.
-                merger = PdfMerger()
+                # Different check stock/layouts must be printed separately.
+                # Moo Development LLC uses its preprinted 3738 template.
+                # All other companies retain the regular layout.
+                pdf_groups = {
+                    "Moo_Development": {"items": [], "records": [], "label": "Moo Development LLC"},
+                    "Other_Companies": {"items": [], "records": [], "label": "Other Companies"},
+                }
                 for (company, account), items in sorted(account_pdf_dict.items()):
-                    for check_no, project, worker, pdf_bytes in sorted(items, key=lambda x: x[0]):
+                    group_key = ("Moo_Development" if str(company).strip().casefold() == "moo development llc"
+                                 else "Other_Companies")
+                    pdf_groups[group_key]["items"].extend(
+                        (company, account, item) for item in sorted(items, key=lambda x: x[0])
+                    )
+                for record in records_log:
+                    group_key = ("Moo_Development" if str(record["Company"]).strip().casefold() == "moo development llc"
+                                 else "Other_Companies")
+                    pdf_groups[group_key]["records"].append(record)
+
+                st.session_state["last_bulk_pdfs"] = {}
+                pdf_urls = {}
+                upload_failed = False
+                for group_key, group in pdf_groups.items():
+                    if not group["items"]:
+                        continue
+                    merger = PdfMerger()
+                    for company, account, (_, project, worker, pdf_bytes) in group["items"]:
                         merger.append(io.BytesIO(pdf_bytes))
-                merged_output = io.BytesIO()
-                merger.write(merged_output)
-                merger.close()
-                all_checks_pdf = merged_output.getvalue()
-                all_checks_filename = f"{pay_date.strftime('%Y-%m-%d')}_All_Companies_{len(records_log)}_Checks.pdf"
+                    merged_output = io.BytesIO()
+                    merger.write(merged_output)
+                    merger.close()
+                    pdf_data = merged_output.getvalue()
+                    filename = f"{pay_date.strftime('%Y-%m-%d')}_{group_key}_{len(group['records'])}_Checks.pdf"
+                    st.session_state["last_bulk_pdfs"][group_key] = {
+                        "pdf": pdf_data, "filename": filename,
+                        "label": group["label"], "count": len(group["records"]),
+                    }
+                    try:
+                        drive_url = upload_all_checks_pdf_to_drive(
+                            pdf_data, pay_date, group["records"], filename_label=group_key
+                        )
+                        for record in group["records"]:
+                            pdf_urls[(record["Company"], record["Account"])] = drive_url
+                        st.success(f"☁️ {group['label']}: uploaded separate PDF to Google Drive.")
+                    except Exception as exc:
+                        upload_failed = True
+                        st.error(f"❌ {group['label']} Drive upload failed: {exc}")
 
-                # Keep download available across Streamlit reruns and after download.
-                st.session_state["last_bulk_pdf"] = all_checks_pdf
-                st.session_state["last_bulk_filename"] = all_checks_filename
-                st.session_state["last_bulk_count"] = len(records_log)
-
-                # One Drive PDF; every check history row points to that same file.
-                try:
-                    drive_url = upload_all_checks_pdf_to_drive(all_checks_pdf, pay_date, records_log)
-                    st.success("☁️ Uploaded one complete bulk PDF to Google Drive.")
-                except Exception as e:
-                    drive_url = None
-                    st.error(f"❌ Drive PDF upload failed: {e}")
-                    st.warning("The combined PDF is available below. No history was saved to avoid missing links.")
-
-                if drive_url:
-                    pdf_urls = {(r["Company"], r["Account"]): drive_url for r in records_log}
+                # Avoid saving partial history when one of the print groups fails.
+                if not upload_failed and pdf_urls:
                     if save_batch_with_pdf_links(records_log, pdf_urls):
                         st.session_state.payroll_list = []
                         st.balloons()
-                        st.success(f"🎉 Saved {len(records_log)} checks to Google Sheets, all linked to the same PDF.")
+                        st.success(f"🎉 Saved {len(records_log)} checks to Google Sheets, with separate PDF links by print template.")
                     else:
-                        st.warning("Drive upload succeeded, but Sheets sync failed. Check before generating again to avoid duplicates.")
+                        st.warning("Drive upload succeeded, but Sheets sync failed. Check before retrying to avoid duplicates.")
+                else:
+                    st.warning("Separate PDFs remain available for download below. History was not saved; check Drive before retrying.")
 
                 if records_log:
                     st.markdown("### 📊 Current Period Disbursement Summary")
@@ -1798,16 +1847,17 @@ elif mode == "👷 Construction Bulk Checks":
     
 
 
-    # Always render the most recently generated PDF, even after a Streamlit rerun.
-    if st.session_state.get("last_bulk_pdf"):
-        st.markdown("### 📥 Download All Checks (One PDF)")
-        st.caption(f"{st.session_state.get('last_bulk_count', 0)} checks, all companies and accounts, in one file.")
-        st.download_button(
-            label="📄 Download All Checks — One PDF",
-            data=st.session_state["last_bulk_pdf"],
-            file_name=st.session_state["last_bulk_filename"],
-            mime="application/pdf",
-            key="download_all_bulk_checks",
-            use_container_width=True,
-            on_click="ignore",
-        )
+    # Retain separate downloads across Streamlit reruns.
+    if st.session_state.get("last_bulk_pdfs"):
+        st.markdown("### 📥 Download Checks — Separate Print Templates")
+        st.caption("Moo Development LLC uses a different check template; print its PDF separately.")
+        for group_key, item in st.session_state["last_bulk_pdfs"].items():
+            st.download_button(
+                label=f"📄 Download {item['label']} — {item['count']} Checks",
+                data=item["pdf"],
+                file_name=item["filename"],
+                mime="application/pdf",
+                key=f"download_bulk_{group_key}",
+                use_container_width=True,
+                on_click="ignore",
+            )
