@@ -509,15 +509,12 @@ def auto_match_stage(worker_name, project_name, default_stg, default_stg_name, d
 def load_project_presets():
     df_p = read_file(GS_SPREADSHEET_NAME, "Project")
     
-    extra_projects = pd.DataFrame([
-        {"Project_Name": "83 Patrician Way", "Company": "Development Company", "Account": "ACC-5027"},
-        {"Project_Name": "365 San Gabrial", "Company": "Development Company", "Account": "ACC-5027"},
-    ])
-
+    # Construction projects/accounts come exclusively from the Google Sheet.
+    # Keep Moo Housing's ACC-* aliases elsewhere in the app.
     if df_p.empty or "Project_Name" not in df_p.columns:
-        return extra_projects
+        return pd.DataFrame(columns=["Project_Name", "Company", "Account", "Company_Name", "Bank_Name", "Routing_Number", "Account_Number"])
 
-    df_combined = pd.concat([df_p, extra_projects], ignore_index=True)
+    df_combined = df_p.copy()
     # Preserve bank details from all rows, including duplicate project names.
     # Backfill missing bank fields from other rows with the same Account.
     bank_cols = ["Bank_Name", "Routing_Number", "Account_Number"]
@@ -944,8 +941,12 @@ preset_project_list = df_projects["Project_Name"].dropna().tolist() if not df_pr
 
 check_history = read_file(GS_SPREADSHEET_NAME, GS_WORKSHEET_NAME)
 all_account_aliases = sorted(set(df_projects["Account"].dropna().astype(str).str.strip()) if "Account" in df_projects.columns else set())
-all_account_aliases = sorted(set(all_account_aliases) | {"ACC-8652", "ACC-3738", "ACC-5027", "Chase-1185"})
-latest_check_map = {alias: next_number_for_account(alias, check_history) for alias in all_account_aliases}
+# Construction: only actual Account values from the Project sheet.
+# Moo Housing retains its legacy ACC-* choices independently.
+all_account_aliases = [a for a in all_account_aliases if a and a.casefold() not in ("nan", "none")]
+moo_housing_aliases = ["ACC-8652", "ACC-3738"]
+all_numbering_accounts = sorted(set(all_account_aliases) | set(moo_housing_aliases) | {"Chase-1185"})
+latest_check_map = {alias: next_number_for_account(alias, check_history) for alias in all_numbering_accounts}
 
 # ----------------- 通用 Stage 联动选择组件 (升级支持强制控制 UI) -----------------
 def render_stage_selector(key_prefix="default", default_stage="", default_stage_name="", default_sub_stage=""):
@@ -1029,7 +1030,7 @@ def number_to_words_usd(amount):
 # Real bank routing/account data must be supplied separately from internal aliases.
 st.sidebar.markdown("### Bank account details")
 st.sidebar.caption("ACC-8652 / Chase-1185 are internal aliases, not MICR account numbers.")
-known_aliases = {"ACC-8652", "ACC-3738", "ACC-5027", "Chase-1185"}
+known_aliases = {"ACC-8652", "ACC-3738", "Chase-1185"}
 if not df_projects.empty and "Account" in df_projects.columns:
     known_aliases.update(str(x).strip() for x in df_projects["Account"].dropna() if str(x).strip())
 chosen_alias = st.sidebar.selectbox("Account alias", sorted(known_aliases))
@@ -1165,7 +1166,7 @@ if mode == "📝 Single Mannul Check":
                 # 如果是 Valente Herrera，无需选择 Project
                 selected_proj = "None (Salary)"
                 project_site = "N/A"
-                project_account = "ACC-5027"
+                project_account = all_account_aliases[0] if all_account_aliases else ""
                 project_company = "Development Company"
                 st.warning("⚠ **Valente Herrera** 默认为内部固定薪资发薪（Salary），不关联任何具体施工项目。")
             else:
@@ -1178,16 +1179,16 @@ if mode == "📝 Single Mannul Check":
         
                 if selected_proj == "No Project / Custom Memo":
                     project_site = ""
-                    project_account = "ACC-5027"
+                    project_account = all_account_aliases[0] if all_account_aliases else ""
                     project_company = "Development Company"
                 elif selected_proj != "+ New Project":
                     project_site = selected_proj
                     p_info = df_projects[df_projects["Project_Name"] == selected_proj].iloc[0]
-                    project_account = str(p_info.get("Account", "ACC-5027")).strip()
+                    project_account = str(p_info.get("Account", "")).strip()
                     project_company = paying_company(p_info) or "Development Company"
                 else:
                     project_site = st.text_input("Project Name", value="New Site")
-                    project_account = "ACC-5027"
+                    project_account = all_account_aliases[0] if all_account_aliases else ""
                     project_company = "Development Company"
         
             payer_entity = st.selectbox(
@@ -1224,7 +1225,7 @@ if mode == "📝 Single Mannul Check":
 
         # For no-project checks, select the paying account independently of Project.
         if main_category == "🏗 Construction" and not project_site:
-            account_num = st.selectbox("Bank Account (required)", all_account_aliases,
+            account_num = st.selectbox("Bank Account (required)", all_account_aliases or [""],
                                        index=all_account_aliases.index(account_num) if account_num in all_account_aliases else 0,
                                        key="single_no_project_account")
             matching_rows = df_projects.loc[df_projects["Account"].astype(str).str.strip() == account_num] if "Account" in df_projects.columns else pd.DataFrame()
@@ -1416,8 +1417,8 @@ elif mode == "👷 Construction Bulk Checks":
     st.subheader("1. Confirm the start check number")
 
     account_start_nums = {}
-    cols = st.columns(min(max(len(all_account_aliases), 1), 4))
-    for idx, alias in enumerate(all_account_aliases):
+    cols = st.columns(min(max(len(all_numbering_accounts), 1), 4))
+    for idx, alias in enumerate(all_numbering_accounts):
         with cols[idx % 4]:
             account_start_nums[alias] = st.number_input(
                 f"🏦 {alias}", min_value=1,
@@ -1535,7 +1536,7 @@ elif mode == "👷 Construction Bulk Checks":
         else:
             if not df_projects.empty and selected_p in df_projects["Project_Name"].values:
                 p_info = df_projects[df_projects["Project_Name"] == selected_p].iloc[0]
-                st.session_state.input_acc = str(p_info.get("Account", "ACC-8652")).strip()
+                st.session_state.input_acc = str(p_info.get("Account", "")).strip()
         
         update_bulk_stage_and_memo()
 
@@ -1551,7 +1552,7 @@ elif mode == "👷 Construction Bulk Checks":
     if "input_acc" not in st.session_state and preset_project_list:
         first_p = preset_project_list[0]
         p_info = df_projects[df_projects["Project_Name"] == first_p].iloc[0]
-        st.session_state.input_acc = str(p_info.get("Account", "ACC-5027")).strip()
+        st.session_state.input_acc = str(p_info.get("Account", "")).strip()
 
     if "input_m" not in st.session_state and preset_worker_list:
         first_w = preset_worker_list[0]
@@ -1767,7 +1768,7 @@ elif mode == "👷 Construction Bulk Checks":
                 if amt <= 0 or not worker_name or cur_check <= 0:
                     continue
     
-                p_info = proj_map.get(project_name, {"Account": "ACC-8652", "Company": "Development Company"})
+                p_info = proj_map.get(project_name, {"Account": "", "Company": "Development Company"})
                 
                 company_name = str(row.get("Company", "")).strip()
                 if not company_name or company_name == "Development Company" or company_name == str(p_info.get("Company", "")).strip():
@@ -1778,7 +1779,7 @@ elif mode == "👷 Construction Bulk Checks":
                 elif company_name == "Moo Housing":
                     account_num = str(row.get("Account", "")).strip() or "ACC-8652"
                 else:
-                    account_num = str(row.get("Account", "")).strip() or str(p_info.get("Account", "ACC-8652")).strip()
+                    account_num = str(row.get("Account", "")).strip() or str(p_info.get("Account", "")).strip()
     
                 full_memo = format_check_memo(project_name, detail_memo)
     
