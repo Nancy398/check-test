@@ -540,9 +540,12 @@ def load_project_presets():
     df_combined["_bank_fields_filled"] = df_combined[bank_cols].apply(
         lambda row: sum(bool(v and v.casefold() not in ("nan", "none")) for v in row), axis=1
     )
-    df_combined = (df_combined.sort_values("_bank_fields_filled", ascending=False, kind="stable")
-                   .drop_duplicates(subset=["Project_Name"], keep="first")
-                   .drop(columns=["_bank_fields_filled"]))
+    df_combined = df_combined.sort_values("_bank_fields_filled", ascending=False, kind="stable")
+    named = df_combined["Project_Name"] != ""
+    df_combined = pd.concat([
+        df_combined.loc[named].drop_duplicates(subset=["Project_Name"], keep="first"),
+        df_combined.loc[~named],
+    ], ignore_index=True).drop(columns=["_bank_fields_filled"])
     # Preserve project ownership in Company and paying entity in Company_Name.
     if "Company_Name" not in df_combined.columns:
         df_combined["Company_Name"] = df_combined.get("Company", "")
@@ -957,6 +960,25 @@ def payer_profile(name):
     return ranked.sort_values("_filled", ascending=False, kind="stable").iloc[0]
 
 
+def moo_development_salary_account():
+    """Use the actual Account in Project sheet for Moo Development LLC, never a hardcoded alias."""
+    source = read_file(GS_SPREADSHEET_NAME, "Project")
+    if source.empty or "Account" not in source.columns:
+        return ""
+    for column in ("Company_Name", "Company"):
+        if column not in source.columns:
+            continue
+        matches = source.loc[source[column].fillna("").astype(str).str.strip().str.casefold() == "moo development llc"]
+        accounts = sorted(set(v for v in matches["Account"].fillna("").astype(str).str.strip() if v and v.casefold() not in ("nan", "none")))
+        if len(accounts) == 1:
+            return accounts[0]
+        if len(accounts) > 1:
+            st.error("Moo Development LLC has multiple accounts in the Project sheet. Please specify one default Salary account.")
+            return ""
+    return ""
+
+valente_salary_account = moo_development_salary_account()
+
 check_history = read_file(GS_SPREADSHEET_NAME, GS_WORKSHEET_NAME)
 all_account_aliases = sorted(set(df_projects["Account"].dropna().astype(str).str.strip()) if "Account" in df_projects.columns else set())
 # Construction: only actual Account values from the Project sheet.
@@ -1180,34 +1202,26 @@ if mode == "📝 Single Mannul Check":
             is_valente = (payee_name == "Valente Herrera")
         
             # 根据 Payee 判断 Project 输入逻辑
+            # Valente defaults to salary, but Project is always selectable.
             if is_valente:
-                # 如果是 Valente Herrera，无需选择 Project
-                selected_proj = "None (Salary)"
-                project_site = "N/A"
-                project_account = all_account_aliases[0] if all_account_aliases else ""
-                project_company = "Development Company"
-                st.warning("⚠ **Valente Herrera** 默认为内部固定薪资发薪（Salary），不关联任何具体施工项目。")
+                st.caption("Valente defaults to Salary paid by Moo Development LLC using its Account from the Project sheet. You may select a project or change the account.")
+            selected_proj = st.selectbox(
+                "Project", project_options, key="single_proj_select",
+                on_change=update_single_check_stage
+            )
+            if selected_proj == "No Project / Custom Memo":
+                project_site = ""
+                project_account = valente_salary_account if is_valente else (all_account_aliases[0] if all_account_aliases else "")
+                project_company = "Moo Development LLC" if is_valente else "Development Company"
+            elif selected_proj != "+ New Project":
+                project_site = selected_proj
+                p_info = df_projects[df_projects["Project_Name"] == selected_proj].iloc[0]
+                project_account = str(p_info.get("Account", "")).strip()
+                project_company = paying_company(p_info) or "Development Company"
             else:
-                selected_proj = st.selectbox(
-                    "Project", 
-                    project_options, 
-                    key="single_proj_select",
-                    on_change=update_single_check_stage
-                )
-        
-                if selected_proj == "No Project / Custom Memo":
-                    project_site = ""
-                    project_account = all_account_aliases[0] if all_account_aliases else ""
-                    project_company = "Development Company"
-                elif selected_proj != "+ New Project":
-                    project_site = selected_proj
-                    p_info = df_projects[df_projects["Project_Name"] == selected_proj].iloc[0]
-                    project_account = str(p_info.get("Account", "")).strip()
-                    project_company = paying_company(p_info) or "Development Company"
-                else:
-                    project_site = st.text_input("Project Name", value="New Site")
-                    project_account = all_account_aliases[0] if all_account_aliases else ""
-                    project_company = "Development Company"
+                project_site = st.text_input("Project Name", value="New Site")
+                project_account = valente_salary_account if is_valente else (all_account_aliases[0] if all_account_aliases else "")
+                project_company = "Moo Development LLC" if is_valente else "Development Company"
         
             payer_entity = st.selectbox(
                 "Payer Entity",
@@ -1246,15 +1260,22 @@ if mode == "📝 Single Mannul Check":
             payee_name = st.text_input("Payee Name", value="", placeholder="Enter payee full name")
 
         # For no-project checks, select the paying account independently of Project.
-        if main_category == "🏗 Construction" and not project_site and payer_entity != "Moo Construction":
-            account_num = st.selectbox("Bank Account (required)", all_account_aliases or [""],
-                                       index=all_account_aliases.index(account_num) if account_num in all_account_aliases else 0,
-                                       key="single_no_project_account")
+        if main_category == "🏗 Construction" and payer_entity != "Moo Construction" and (not project_site or is_valente):
+            account_options = list(dict.fromkeys(([valente_salary_account] if is_valente and valente_salary_account else []) + all_account_aliases))
+            account_num = st.selectbox("Bank Account (required)", account_options or [""],
+                                       index=account_options.index(account_num) if account_num in account_options else 0,
+                                       key=f"single_account_{'valente' if is_valente else 'no_project'}_{selected_proj}")
+            if is_valente and not project_site and account_num == valente_salary_account:
+                company_name = "Moo Development LLC"
             matching_rows = df_projects.loc[df_projects["Account"].astype(str).str.strip() == account_num] if "Account" in df_projects.columns else pd.DataFrame()
             if not matching_rows.empty and payer_entity != "Moo Construction":
                 issuers = sorted(set(paying_company(row) for _, row in matching_rows.iterrows() if paying_company(row)))
                 if issuers:
-                    company_name = st.selectbox("Company_Name (check issuer)", issuers, key="single_no_project_company")
+                    company_name = st.selectbox("Company_Name (check issuer)", issuers,
+                                                index=issuers.index(company_name) if company_name in issuers else 0,
+                                                key=f"single_account_company_{account_num}")
+        if main_category == "🏗 Construction" and is_valente and not valente_salary_account:
+            st.warning("No unique Moo Development LLC Account found in the Project sheet. Add or correct its Company_Name and Account.")
         company_display = st.text_input("Company Display Name", value=company_name, key=f"company_display_{company_name}")
 
         st.markdown("##### Bank Information")
@@ -1296,8 +1317,8 @@ if mode == "📝 Single Mannul Check":
             )
 
             if not project_site:
-                selected_stage_str = ""
-                default_memo_text = ""
+                selected_stage_str = "Valente Salary (Payroll)" if is_valente else ""
+                default_memo_text = "Salary" if is_valente else ""
             else:
                 st.markdown("##### 🏗 工程阶段 (Stage Selection)")
                 st_code, st_name, sub1, sub2 = render_stage_selector(
@@ -1528,10 +1549,11 @@ elif mode == "👷 Construction Bulk Checks":
     def update_bulk_stage_and_memo():
         selected_w = st.session_state.get("input_w", "")
         selected_p = st.session_state.get("input_p", "")
+        if selected_w == "Valente Herrera" and not selected_p and st.session_state.get("_valente_default_account_applied") != "Valente Herrera":
+            st.session_state.input_acc = valente_salary_account
+            st.session_state["_valente_default_account_applied"] = "Valente Herrera"
         
-        if selected_w == "Valente Herrera":
-            st.session_state.input_p = ""
-            selected_p = ""
+        # Valente defaults to Salary without a project, but users may choose a project.
         
         w_stg, w_stg_name, w_sub_stg = "", "", ""
         if not df_workers.empty and selected_w in df_workers["Worker_Name"].values:
@@ -1551,7 +1573,9 @@ elif mode == "👷 Construction Bulk Checks":
         c_type = st.session_state.get("input_company_type", "Development Company")
         selected_p = st.session_state.get("input_p", "")
 
-        if c_type == "Moo Construction":
+        if selected_p == "" and st.session_state.get("input_w") == "Valente Herrera" and c_type == "Development Company":
+            st.session_state.input_acc = valente_salary_account
+        elif c_type == "Moo Construction":
             profile = payer_profile("MOO CONSTRUCTION")
             st.session_state.input_acc = str(profile.get("Account", "")).strip() if profile is not None else ""
         elif c_type == "Moo Housing":
@@ -1605,14 +1629,22 @@ elif mode == "👷 Construction Bulk Checks":
         )
 
     is_valente = (add_worker == "Valente Herrera")
-    project_options = [""] if is_valente else preset_project_list
+    project_options = [""] + preset_project_list
+    if is_valente and "input_p" not in st.session_state:
+        st.session_state.input_p = ""
+    if is_valente and not st.session_state.get("input_p") and st.session_state.get("input_company_type") == "Development Company":
+        # Do not override an account manually selected by the user.
+        if st.session_state.get("_valente_default_account_applied") != "Valente Herrera":
+            st.session_state.input_acc = valente_salary_account
+            st.session_state["_valente_default_account_applied"] = "Valente Herrera"
+    elif not is_valente:
+        st.session_state["_valente_default_account_applied"] = ""
 
     with r1_c3:
         add_proj = st.selectbox(
             "Project", 
             project_options, 
             key="input_p",
-            disabled=is_valente,
             on_change=update_account_and_company
         )
     with r1_c4:
@@ -1662,7 +1694,7 @@ elif mode == "👷 Construction Bulk Checks":
     with r2_c5:
         st.markdown("<br>", unsafe_allow_html=True)
         if st.button("➕ Add", type="primary", use_container_width=True):
-            final_project_val = "" if add_worker == "Valente Herrera" else add_proj
+            final_project_val = add_proj
 
             history = read_file(GS_SPREADSHEET_NAME, GS_WORKSHEET_NAME)
             next_chk = next_number_for_account(add_account, history, st.session_state.payroll_list,
@@ -1674,8 +1706,12 @@ elif mode == "👷 Construction Bulk Checks":
                 if not df_projects.empty and final_project_val in df_projects["Project_Name"].values:
                     p_row_info = df_projects[df_projects["Project_Name"] == final_project_val].iloc[0]
                     final_company_val = paying_company(p_row_info) or "Development Company"
+                elif add_worker == "Valente Herrera" and valente_salary_account and add_account == valente_salary_account:
+                    final_company_val = "Moo Development LLC"
                 else:
-                    final_company_val = "Development Company"
+                    # For no-project checks, infer the issuer from the selected account.
+                    matches = df_projects.loc[df_projects["Account"].astype(str).str.strip() == str(add_account).strip()]
+                    final_company_val = paying_company(matches.iloc[0]) if not matches.empty else "Development Company"
             else:
                 final_company_val = add_comp_type
 
