@@ -275,7 +275,7 @@ st.set_page_config(
 # ----------------- 配置文件与路径定义 -----------------
 
 GS_SPREADSHEET_NAME = "Check Issuance History"  # Google 表格的名字
-GS_WORKSHEET_NAME = "Sheet1"                  # 历史记录工作表的名字
+GS_WORKSHEET_NAME = "Construction Check"                  # 历史记录工作表的名字
 
 # ----------------- 1. 获取 Authorization 客户端 -----------------
 def get_gc_client():
