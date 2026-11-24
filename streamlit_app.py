@@ -1,4 +1,8 @@
 import base64
+import hashlib
+import json
+from datetime import datetime, timezone
+import uuid
 from datetime import date
 import io
 import os
@@ -22,28 +26,43 @@ from collections import defaultdict
 
 # -------- Weekly checklist import: Google Cloud Vision OCR + manual review --------
 def checklist_rows_from_excel(upload):
-    """Import one row per worker from the provided Weekly Payroll Excel template."""
+    """Accept old Payee/Total/Projects or direct Payee/Amount/Project Excel.
+
+    Optional Stage, Sub-Stage and Memo are passed through to every resulting check.
+    When one source row names several projects, stage metadata applies to each split.
+    """
     try:
-        df = pd.read_excel(io.BytesIO(upload.getvalue()), sheet_name=0, dtype={"Payee": str, "Projects": str}, engine="openpyxl")
+        df = pd.read_excel(io.BytesIO(upload.getvalue()), sheet_name=0,
+                           dtype={"Payee": str, "Projects": str, "Project": str,
+                                  "Stage": str, "Sub-Stage": str, "Memo": str}, engine="openpyxl")
     except ImportError as exc:
         raise ValueError("Excel import requires openpyxl. Add openpyxl to requirements.txt.") from exc
     except Exception as exc:
         raise ValueError(f"Cannot read Excel file: {exc}") from exc
     df.columns = [str(c).strip() for c in df.columns]
+    aliases = {"Payee Name": "Payee", "Worker": "Payee", "Amount": "Total",
+               "Project": "Projects", "Sub_Stage": "Sub-Stage", "Sub Stage": "Sub-Stage"}
+    df = df.rename(columns={k: v for k, v in aliases.items() if k in df.columns and v not in df.columns})
     required = {"Payee", "Total", "Projects"}
     if not required.issubset(df.columns):
-        raise ValueError("Excel columns must include: Payee, Total, Projects (use the supplied template).")
+        raise ValueError("Excel must include Payee, Total, Projects (or Payee, Amount, Project). Optional: Stage, Sub-Stage, Memo.")
+    def cell(row, key):
+        value = row.get(key, "")
+        if pd.isna(value):
+            return ""
+        return str(value).strip()
     parsed = []
     for i, row in df.iterrows():
-        name = "" if pd.isna(row["Payee"]) else str(row["Payee"]).strip()
+        name = cell(row, "Payee")
         if not name:
             continue
-        raw_amount = row["Total"]
-        amount = "" if pd.isna(raw_amount) else str(raw_amount).strip()
-        projects = "" if pd.isna(row["Projects"]) else str(row["Projects"]).strip()
+        amount = cell(row, "Total")
+        projects = cell(row, "Projects")
         if projects.endswith(".0") and projects[:-2].isdigit():
             projects = projects[:-2]
         parsed.append({"Payee": name, "Total": amount, "Projects": projects,
+                       "Stage": cell(row, "Stage"), "Sub-Stage": cell(row, "Sub-Stage"),
+                       "Memo": cell(row, "Memo"),
                        "Raw": f"Excel row {i+2}: {name} | {amount} | {projects}"})
     if not parsed:
         raise ValueError("No worker rows found in Excel.")
@@ -166,16 +185,19 @@ def expand_weekly_rows(rows, projects):
         except (InvalidOperation, ValueError):
             total, valid_amount = Decimal(0), False
         amounts = split_cents_evenly(total, len(tokens)) if valid_amount and tokens else [0] * len(tokens)
+        common = {"Stage": stage_code_only(row.get("Stage", "")),
+                  "Sub-Stage": str(row.get("Sub-Stage", "") or "").strip(),
+                  "Memo": str(row.get("Memo", "") or "").strip()}
         if not tokens:
             expanded.append({"Source": source_index, "Payee": name, "Original Total": float(total),
                              "Project Code": "", "Project": "", "Amount": 0.0,
-                             "Status": "Missing project", "Raw": row.get("Raw", "")})
+                             "Status": "Missing project", "Raw": row.get("Raw", ""), **common})
         for i, token in enumerate(tokens):
             matched = resolve_checklist_project(token, projects)
             status = "Ready" if matched and valid_amount and name else ("Missing amount" if not valid_amount else "Project not matched")
             expanded.append({"Source": source_index, "Payee": name, "Original Total": float(total),
                              "Project Code": token, "Project": matched or "", "Amount": amounts[i],
-                             "Status": status, "Raw": row.get("Raw", "")})
+                             "Status": status, "Raw": row.get("Raw", ""), **common})
     return expanded
 
 
@@ -309,6 +331,133 @@ def save_to_history(records):
     except Exception as e:
         st.error(f"❌ 数据保存至 Google Sheets 失败: {e}")
         return False
+
+# ----------------- OCR cache + persistent editable drafts -----------------
+# Sheets are intentionally separate from issued-check history. No draft is issued.
+DRAFT_SHEET = "Check Drafts"
+OCR_CACHE_SHEET = "Checklist OCR Cache"
+DRAFT_HEADERS = ["Draft ID", "Updated At UTC", "Title", "Rows JSON"]
+CACHE_HEADERS = ["SHA256", "Saved At UTC", "Filename", "Rows JSON"]
+
+
+def _storage_ws(name, headers):
+    gc = get_gc_client()
+    spreadsheet = gc.open(GS_SPREADSHEET_NAME)
+    try:
+        ws = spreadsheet.worksheet(name)
+    except gspread.WorksheetNotFound:
+        ws = spreadsheet.add_worksheet(title=name, rows=1000, cols=max(len(headers), 4))
+        ws.append_row(headers, value_input_option="RAW")
+    if ws.row_values(1) != headers:
+        raise ValueError(f"{name}: unexpected headers; please check this tab before continuing")
+    return ws
+
+
+def _utc():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _json_safe_rows(rows):
+    def safe(v):
+        if isinstance(v, Decimal):
+            return float(v)
+        if v is None or (not isinstance(v, (dict, list)) and pd.isna(v)):
+            return ""
+        if hasattr(v, "item"):
+            try: return v.item()
+            except (AttributeError, ValueError): pass
+        return v
+    return [{str(k): safe(v) for k, v in row.items()} for row in rows]
+
+
+def _append_json_record(sheet_name, headers, fields, rows):
+    payload = json.dumps(_json_safe_rows(rows), ensure_ascii=False, separators=(",", ":"))
+    # Google Sheets limits individual cell content to 50,000 characters.
+    if len(payload) >= 45000:
+        raise ValueError("Draft is too large for one Google Sheets cell. Download Excel and split into smaller batches.")
+    ws = _storage_ws(sheet_name, headers)
+    ws.append_row([*fields, payload], value_input_option="RAW")
+
+
+def list_saved_drafts():
+    records = _storage_ws(DRAFT_SHEET, DRAFT_HEADERS).get_all_records()
+    latest = {}
+    for rec in records:
+        draft_id = str(rec.get("Draft ID", "")).strip()
+        if draft_id:
+            latest[draft_id] = rec
+    return sorted(latest.values(), key=lambda r: str(r.get("Updated At UTC", "")), reverse=True)
+
+
+def save_check_draft(draft_id, title, rows):
+    if not str(draft_id).strip():
+        raise ValueError("Draft ID is required")
+    _append_json_record(DRAFT_SHEET, DRAFT_HEADERS,
+                        [str(draft_id), _utc(), str(title).strip()], rows)
+
+
+def read_check_draft(draft_id):
+    matches = [r for r in list_saved_drafts() if str(r.get("Draft ID", "")) == str(draft_id)]
+    if not matches:
+        raise ValueError("Saved draft not found")
+    return json.loads(matches[0]["Rows JSON"])
+
+
+def read_ocr_cache(digest):
+    ws = _storage_ws(OCR_CACHE_SHEET, CACHE_HEADERS)
+    records = ws.get_all_records()
+    for rec in reversed(records):
+        if str(rec.get("SHA256", "")) == digest:
+            return json.loads(rec.get("Rows JSON", "[]"))
+    return None
+
+
+def get_or_create_ocr(upload):
+    # Hash is of exact file bytes: upload again = no Vision API request.
+    digest = hashlib.sha256(upload.getvalue()).hexdigest()
+    cached = read_ocr_cache(digest)
+    if cached is not None:
+        return cached, True
+    extracted = checklist_ocr(upload)
+    # Write the raw OCR results before the user begins editing.
+    _append_json_record(OCR_CACHE_SHEET, CACHE_HEADERS,
+                        [digest, _utc(), upload.name], extracted)
+    return extracted, False
+
+
+def draft_excel_bytes(rows):
+    df = pd.DataFrame(_json_safe_rows(rows))
+    export = pd.DataFrame({
+        "Payee": df.get("Payee", pd.Series(dtype=str)),
+        "Amount": df.get("Amount", pd.Series(dtype=float)),
+        "Project": df.get("Project", pd.Series(dtype=str)),
+        "Stage": df.get("Stage", pd.Series(dtype=str)),
+        "Sub-Stage": df.get("Sub-Stage", pd.Series(dtype=str)),
+        "Memo": df.get("Memo", pd.Series(dtype=str)),
+    })
+    # Preserve ambiguous OCR project codes for offline correction.
+    if "Project Code" in df.columns:
+        missing = export["Project"].fillna("").astype(str).str.strip() == ""
+        export.loc[missing, "Project"] = df.loc[missing, "Project Code"]
+    out = io.BytesIO()
+    with pd.ExcelWriter(out, engine="openpyxl") as writer:
+        export.to_excel(writer, sheet_name="Checks", index=False)
+        sh = writer.sheets["Checks"]
+        sh.freeze_panes = "A2"
+        sh.auto_filter.ref = sh.dimensions
+        for col, width in {"A": 27, "B": 16, "C": 29, "D": 18, "E": 26, "F": 40}.items():
+            sh.column_dimensions[col].width = width
+        for cell in sh["B"][1:]:
+            cell.number_format = '#,##0.00'
+    return out.getvalue()
+
+
+def install_weekly_review(rows, draft_id=None, title=None):
+    st.session_state.weekly_review_rows = _json_safe_rows(rows)
+    st.session_state.weekly_draft_id = draft_id or uuid.uuid4().hex[:12]
+    st.session_state.weekly_draft_title = title or f"Checklist {_utc()}"
+    st.session_state.weekly_editor_version = st.session_state.get("weekly_editor_version", 0) + 1
+
 
 # ----------------- Drive PDF archive (one merged PDF per company/account) -----------------
 def merged_pdf_filename(company, alias, issue_date, check_numbers):
@@ -1476,74 +1625,130 @@ elif mode == "👷 Construction Bulk Checks":
     if "payroll_list" not in st.session_state:
         st.session_state.payroll_list = []
 
-    st.markdown("### 📋 Import Weekly Payroll Checklist")
-    import_type = st.radio("Import method", ["Excel (.xlsx) — recommended", "Image / PDF (Vision OCR)"], horizontal=True)
+    st.markdown("### 📋 Image → OCR → Saved Draft → Excel / Checks")
+    st.caption("Images are recognized only on explicit request. Recognition results are cached by file hash in Google Sheets; reviewing, editing, downloading, or reloading does NOT call Vision API.")
+
+    with st.expander("📂 Open a previously saved draft", expanded=False):
+        try:
+            existing_drafts = list_saved_drafts()
+            if existing_drafts:
+                choices = {f"{r['Title']} | {r['Updated At UTC']} UTC | {r['Draft ID']}": str(r['Draft ID']) for r in existing_drafts}
+                chosen = st.selectbox("Saved drafts (newest first)", options=list(choices))
+                if st.button("📂 Open selected draft"):
+                    selected_id = choices[chosen]
+                    install_weekly_review(read_check_draft(selected_id), selected_id,
+                                          next(r["Title"] for r in existing_drafts if str(r["Draft ID"]) == selected_id))
+                    st.rerun()
+            else:
+                st.info("No saved drafts yet.")
+        except Exception as exc:
+            st.warning(f"Cannot list saved drafts: {exc}")
+
+    import_type = st.radio("Import method", ["Image / PDF (Vision OCR)", "Excel (.xlsx)"], horizontal=True)
     if import_type.startswith("Excel"):
-        st.caption("Use columns Payee, Total, Projects. Separate multiple project codes with / (e.g. 6528/83). Amounts are split equally by default. Blank amounts/projects require review.")
-        weekly_excel = st.file_uploader("Upload Weekly Payroll Excel", type=["xlsx"], key="weekly_excel_upload")
+        st.caption("Upload an exported edited draft or existing Excel. Supports Payee/Amount/Project/Stage/Sub-Stage/Memo and original Payee/Total/Projects format.")
+        weekly_excel = st.file_uploader("Upload Excel", type=["xlsx"], key="weekly_excel_upload")
         if st.button("📊 Import Excel", disabled=weekly_excel is None):
             try:
                 extracted = checklist_rows_from_excel(weekly_excel)
-                st.session_state.weekly_raw_rows = extracted
-                st.session_state.weekly_review_rows = expand_weekly_rows(extracted, df_projects)
-                st.success(f"Imported {len(extracted)} worker rows. Review the split amounts and projects below.")
+                install_weekly_review(expand_weekly_rows(extracted, df_projects), title=weekly_excel.name)
+                try:
+                    save_check_draft(st.session_state.weekly_draft_id, st.session_state.weekly_draft_title,
+                                     st.session_state.weekly_review_rows)
+                    st.success(f"Imported {len(extracted)} rows and auto-saved a draft.")
+                except Exception as save_exc:
+                    st.warning(f"Imported {len(extracted)} rows, but draft auto-save failed: {save_exc}. Download Excel to avoid losing edits.")
             except Exception as exc:
                 st.error(f"Excel import failed: {exc}")
     else:
-        st.caption("Image OCR uses Google Cloud Vision. Review every name, amount, and project before generating checks.")
         weekly_files = st.file_uploader("Weekly checklist images / PDF", type=["png", "jpg", "jpeg", "pdf"], accept_multiple_files=True, key="weekly_checklist_upload")
-        if st.button("🔍 Read checklist", disabled=not weekly_files):
+        if st.button("🔍 Recognize images (only if uncached)", disabled=not weekly_files):
             try:
                 extracted = []
+                cache_hits = 0
                 for uploaded in weekly_files:
-                    extracted.extend(checklist_ocr(uploaded))
-                st.session_state.weekly_raw_rows = extracted
-                st.session_state.weekly_review_rows = expand_weekly_rows(extracted, df_projects)
-                st.success(f"OCR returned {len(extracted)} potential worker entries. Please review all fields.")
+                    rows, was_cached = get_or_create_ocr(uploaded)
+                    extracted.extend(rows)
+                    cache_hits += int(was_cached)
+                install_weekly_review(expand_weekly_rows(extracted, df_projects),
+                                      title=" / ".join(x.name for x in weekly_files)[:100])
+                try:
+                    save_check_draft(st.session_state.weekly_draft_id, st.session_state.weekly_draft_title,
+                                     st.session_state.weekly_review_rows)
+                    st.success(f"Recognized {len(extracted)} potential rows and auto-saved a draft. {cache_hits}/{len(weekly_files)} files came from cache without OCR API requests.")
+                except Exception as save_exc:
+                    st.warning(f"Recognized {len(extracted)} rows, but draft auto-save failed: {save_exc}. Download Excel to avoid losing edits.")
             except Exception as exc:
-                st.error(f"Checklist recognition failed: {exc}")
-                st.info("Check Google Cloud Vision API activation and service-account access, or import Excel instead.")
+                st.error(f"Recognition/cache error: {exc}")
+                st.info("If the Google Sheets cache cannot be accessed, the image is not processed; this avoids accidental repeated API charges.")
+
     if st.session_state.get("weekly_review_rows") is not None:
-        st.caption("Source identifies each original checklist line. Multiple projects are split equally by default. Adjust Amount for exceptions; every source must still total its Original Total.")
+        st.markdown("#### ✏️ Editable Draft — no OCR API calls")
         weekly_df = pd.DataFrame(st.session_state.weekly_review_rows)
         if not weekly_df.empty:
-            reviewed = st.data_editor(weekly_df, num_rows="dynamic", hide_index=True,
-                disabled=["Source", "Original Total", "Raw", "Status"],
-                column_config={"Project": st.column_config.SelectboxColumn("Project", options=preset_project_list),
-                               "Amount": st.column_config.NumberColumn("Amount", min_value=0, format="$%.2f")},
-                key="weekly_review_editor", use_container_width=True)
-            st.session_state.weekly_review_rows = reviewed.to_dict("records")
-            issues = validate_weekly_rows(st.session_state.weekly_review_rows, df_projects)
+            if "Stage" not in weekly_df.columns: weekly_df["Stage"] = ""
+            if "Sub-Stage" not in weekly_df.columns: weekly_df["Sub-Stage"] = ""
+            if "Memo" not in weekly_df.columns: weekly_df["Memo"] = ""
+            reviewed = st.data_editor(
+                weekly_df, num_rows="dynamic", hide_index=True,
+                disabled=[c for c in ["Source", "Original Total", "Raw", "Status"] if c in weekly_df.columns],
+                column_config={
+                    "Project": st.column_config.SelectboxColumn("Project", options=[""] + preset_project_list),
+                    "Amount": st.column_config.NumberColumn("Amount", min_value=0, format="$%.2f"),
+                    "Stage": st.column_config.TextColumn("Stage code"),
+                    "Sub-Stage": st.column_config.TextColumn("Sub-Stage"),
+                    "Memo": st.column_config.TextColumn("Memo"),
+                },
+                key=f"weekly_review_editor_{st.session_state.get('weekly_editor_version', 0)}",
+                use_container_width=True)
+            st.session_state.weekly_review_rows = _json_safe_rows(reviewed.to_dict("records"))
+            current_rows = st.session_state.weekly_review_rows
+            st.text_input("Draft name", key="weekly_draft_title")
+            col_save, col_download = st.columns(2)
+            with col_save:
+                if st.button("💾 Save draft to Google Sheets", use_container_width=True):
+                    try:
+                        save_check_draft(st.session_state.weekly_draft_id,
+                                         st.session_state.weekly_draft_title, current_rows)
+                        st.success("Draft saved. Reopen it later from Saved Drafts; no OCR rerun needed.")
+                    except Exception as exc:
+                        st.error(f"Draft save failed: {exc}")
+            with col_download:
+                st.download_button("⬇️ Download editable Excel", data=draft_excel_bytes(current_rows),
+                                   file_name=f"check_draft_{st.session_state.get('weekly_draft_id', 'export')}.xlsx",
+                                   mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                   use_container_width=True)
+            issues = validate_weekly_rows(current_rows, df_projects)
             if issues:
-                st.warning(f"{len(issues)} item(s) require attention: " + "; ".join(issues[:8]))
+                st.warning(f"{len(issues)} items to review: " + "; ".join(issues[:8]))
+            st.caption("Drafts are not issued checks. Saving a draft never allocates check numbers or writes issuance history.")
             if st.button("➕ Add reviewed checks to batch", disabled=bool(issues)):
-                history = read_file(GS_SPREADSHEET_NAME, GS_WORKSHEET_NAME)
-                staged = list(st.session_state.payroll_list)
-                for row in st.session_state.weekly_review_rows:
-                    project = str(row["Project"])
-                    p = df_projects.loc[df_projects["Project_Name"] == project].iloc[0]
-                    company, account = paying_company(p), str(p["Account"]).strip()
-                    # Bank aliases must be configured; never silently substitute an unrelated account.
-                    ensure_bank(account, project)
-                    start = account_start_nums.get(account, 1001)
-                    number = next_number_for_account(account, history, staged, start)
-                    # Use the latest saved Stage for this worker/project; users can
-                    # override Stage and Memo in the final Review & Edit table.
-                    prior_stage = latest_stage_for_worker(history, row["Payee"], project)
-                    stage_code = stage_code_only(prior_stage)
-                    sub_stage = saved_sub_stage(prior_stage)
-                    staged.append({"Company": company, "Payee": str(row["Payee"]).strip(),
-                                   "Project": project, "Account": account, "Stage": stage_code,
-                                   "Sub-Stage": sub_stage,
-                                   "Days": None, "Rate": None, "Check #": number,
-                                   "Amount": float(row["Amount"]),
-                                   "Memo": default_memo_for_stage(stage_code, sub_stage, df_stages)})
-                st.session_state.payroll_list = staged
-                st.session_state.weekly_review_rows = None
-                st.success(f"Added {len(reviewed)} checks. Stage defaults to the latest saved stage for each worker/project; review and edit it below before generating.")
-                st.rerun()
+                try:
+                    history = read_file(GS_SPREADSHEET_NAME, GS_WORKSHEET_NAME)
+                    staged = list(st.session_state.payroll_list)
+                    for row in current_rows:
+                        project = str(row["Project"])
+                        p = df_projects.loc[df_projects["Project_Name"] == project].iloc[0]
+                        company, account = paying_company(p), str(p["Account"]).strip()
+                        ensure_bank(account, project)
+                        start = account_start_nums.get(account, 1001)
+                        number = next_number_for_account(account, history, staged, start)
+                        prior_stage = latest_stage_for_worker(history, row["Payee"], project)
+                        stage_code = stage_code_only(row.get("Stage", "")) or stage_code_only(prior_stage)
+                        sub_stage = str(row.get("Sub-Stage", "") or "").strip() or (saved_sub_stage(prior_stage) if not str(row.get("Stage", "") or "").strip() else "")
+                        explicit_memo = str(row.get("Memo", "") or "").strip()
+                        staged.append({"Company": company, "Payee": str(row["Payee"]).strip(),
+                                       "Project": project, "Account": account, "Stage": stage_code,
+                                       "Sub-Stage": sub_stage, "Days": None, "Rate": None,
+                                       "Check #": number, "Amount": float(row["Amount"]),
+                                       "Memo": explicit_memo or default_memo_for_stage(stage_code, sub_stage, df_stages)})
+                    st.session_state.payroll_list = staged
+                    st.success(f"Added {len(current_rows)} checks. Review the final batch below before issuing.")
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"Cannot add checks to batch: {exc}")
         else:
-            st.warning("No recognizable checklist rows. Try a clearer photo or enter the rows manually.")
+            st.warning("Draft is empty. Upload a file or open a saved draft.")
     st.markdown("---")
 
     def update_bulk_stage_and_memo():
