@@ -34,14 +34,14 @@ def checklist_rows_from_excel(upload):
     try:
         df = pd.read_excel(io.BytesIO(upload.getvalue()), sheet_name=0,
                            dtype={"Payee": str, "Projects": str, "Project": str,
-                                  "Stage": str, "Sub-Stage": str, "Memo": str}, engine="openpyxl")
+                                  "Stage": str, "Sub-Stage": str, "Memo": str, "Project ID": str, "Project Code": str, "Company": str, "Check Type": str}, engine="openpyxl")
     except ImportError as exc:
         raise ValueError("Excel import requires openpyxl. Add openpyxl to requirements.txt.") from exc
     except Exception as exc:
         raise ValueError(f"Cannot read Excel file: {exc}") from exc
     df.columns = [str(c).strip() for c in df.columns]
     aliases = {"Payee Name": "Payee", "Worker": "Payee", "Amount": "Total",
-               "Project": "Projects", "Sub_Stage": "Sub-Stage", "Sub Stage": "Sub-Stage"}
+               "Project": "Projects", "Project Name": "Projects", "Sub_Stage": "Sub-Stage", "Sub Stage": "Sub-Stage", "Project_ID": "Project ID"}
     df = df.rename(columns={k: v for k, v in aliases.items() if k in df.columns and v not in df.columns})
     required = {"Payee", "Total", "Projects"}
     if not required.issubset(df.columns):
@@ -62,7 +62,8 @@ def checklist_rows_from_excel(upload):
             projects = projects[:-2]
         parsed.append({"Payee": name, "Total": amount, "Projects": projects,
                        "Stage": cell(row, "Stage"), "Sub-Stage": cell(row, "Sub-Stage"),
-                       "Memo": cell(row, "Memo"),
+                       "Memo": cell(row, "Memo"), "Project ID": cell(row, "Project ID"),
+                       "Company": cell(row, "Company"), "Check Type": cell(row, "Check Type"),
                        "Raw": f"Excel row {i+2}: {name} | {amount} | {projects}"})
     if not parsed:
         raise ValueError("No worker rows found in Excel.")
@@ -187,7 +188,10 @@ def expand_weekly_rows(rows, projects):
         amounts = split_cents_evenly(total, len(tokens)) if valid_amount and tokens else [0] * len(tokens)
         common = {"Stage": stage_code_only(row.get("Stage", "")),
                   "Sub-Stage": str(row.get("Sub-Stage", "") or "").strip(),
-                  "Memo": str(row.get("Memo", "") or "").strip()}
+                  "Memo": str(row.get("Memo", "") or "").strip(),
+                  "Project ID": str(row.get("Project ID", "") or "").strip().removesuffix(".0"),
+                  "Company": str(row.get("Company", "") or "").strip(),
+                  "Check Type": str(row.get("Check Type", "") or "").strip()}
         if not tokens:
             expanded.append({"Source": source_index, "Payee": name, "Original Total": float(total),
                              "Project Code": "", "Project": "", "Amount": 0.0,
@@ -201,7 +205,7 @@ def expand_weekly_rows(rows, projects):
     return expanded
 
 
-def validate_weekly_rows(rows, projects):
+def validate_weekly_rows(rows, projects, other_mode=False):
     errors = []
     groups = defaultdict(list)
     valid_projects = set(projects["Project_Name"].astype(str)) if not projects.empty else set()
@@ -219,7 +223,14 @@ def validate_weekly_rows(rows, projects):
         if not str(row.get("Payee", "")).strip():
             errors.append(f"Row {idx+1}: missing payee")
         project = str(row.get("Project", "")).strip()
-        if project not in valid_projects:
+        if other_mode:
+            company = str(row.get("Company", "") or "").strip()
+            profile = payer_profile(company) if company else None
+            if profile is None:
+                errors.append(f"Row {idx+1}: Company not matched to Project sheet payer profile")
+            elif not str(profile.get("Account", "") or "").strip():
+                errors.append(f"Row {idx+1}: Company missing bank account")
+        elif project not in valid_projects:
             errors.append(f"Row {idx+1}: project not matched to Google Sheets")
         else:
             p = projects.loc[projects["Project_Name"] == project].iloc[0]
@@ -275,7 +286,8 @@ st.set_page_config(
 # ----------------- 配置文件与路径定义 -----------------
 
 GS_SPREADSHEET_NAME = "Check Issuance History"  # Google 表格的名字
-GS_WORKSHEET_NAME = "Construction Check"                  # 历史记录工作表的名字
+GS_WORKSHEET_NAME = "Sheet1"  # Official issuance history; do not use the summary tab for check numbering
+GS_CONSTRUCTION_SUMMARY = "Construction Check"
 
 # ----------------- 1. 获取 Authorization 客户端 -----------------
 def get_gc_client():
@@ -434,6 +446,9 @@ def draft_excel_bytes(rows):
         "Stage": df.get("Stage", pd.Series(dtype=str)),
         "Sub-Stage": df.get("Sub-Stage", pd.Series(dtype=str)),
         "Memo": df.get("Memo", pd.Series(dtype=str)),
+        "Project ID": df.get("Project ID", pd.Series(dtype=str)),
+        "Company": df.get("Company", pd.Series(dtype=str)),
+        "Check Type": df.get("Check Type", pd.Series(dtype=str)),
     })
     # Preserve ambiguous OCR project codes for offline correction.
     if "Project Code" in df.columns:
@@ -445,7 +460,7 @@ def draft_excel_bytes(rows):
         sh = writer.sheets["Checks"]
         sh.freeze_panes = "A2"
         sh.auto_filter.ref = sh.dimensions
-        for col, width in {"A": 27, "B": 16, "C": 29, "D": 18, "E": 26, "F": 40}.items():
+        for col, width in {"A": 27, "B": 16, "C": 29, "D": 18, "E": 26, "F": 40, "G": 19, "H": 29, "I": 17}.items():
             sh.column_dimensions[col].width = width
         for cell in sh["B"][1:]:
             cell.number_format = '#,##0.00'
@@ -547,9 +562,10 @@ def save_batch_with_pdf_links(records, pdf_urls):
         gc = get_gc_client()
         ws = gc.open(GS_SPREADSHEET_NAME).worksheet(GS_WORKSHEET_NAME)
         headers = ws.row_values(1)
-        if "PDF Link" not in headers:
-            ws.update_cell(1, len(headers) + 1, "PDF Link")
-            headers.append("PDF Link")
+        for extra in ("PDF Link", "Project ID"):
+            if extra not in headers:
+                ws.update_cell(1, len(headers) + 1, extra)
+                headers.append(extra)
         data = []
         for r in records:
             fields = {
@@ -557,11 +573,15 @@ def save_batch_with_pdf_links(records, pdf_urls):
                 "Company": r["Company"], "Account": r["Account"],
                 "Project": r["Project"], "Stage": r.get("Stage", ""),
                 "Payee Name": r["Payee Name"], "Amount": r["Amount"],
-                "Memo": r["Memo"],
+                "Memo": r["Memo"], "Project ID": r.get("Project ID", ""),
                 "PDF Link": pdf_urls.get((r["Company"], r["Account"]), ""),
             }
             data.append([fields.get(h, "") for h in headers])
         ws.append_rows(data, value_input_option="USER_ENTERED")
+        try:
+            sync_construction_project_summary()
+        except Exception as summary_exc:
+            st.warning(f"Checks saved to Sheet1, but Construction Check summary refresh failed: {summary_exc}")
         return True
     except Exception as e:
         st.error(f"❌ Failed to save history/PDF links to Google Sheets: {e}")
@@ -596,10 +616,66 @@ def latest_stage_for_worker(history, payee, project):
     return str((matching if not matching.empty else data).iloc[-1]["Stage"])
 
 
+# Construction Stage fallback is project-wide, not worker-wide.
+def project_identity(value):
+    value = str(value or "").strip().casefold()
+    match = re.match(r"^(\d{2,6})(?!\d)", value)
+    return match.group(1) if match else re.sub(r"\s+", " ", value)
+
+def is_nonconstruction_stage(row):
+    content = " ".join(str(row.get(x, "") or "") for x in ("Stage", "Memo"))
+    return bool(re.search(r"bookkeep|accounting fee|management fee", content, re.I))
+
+def latest_stage_for_project(history, project):
+    if history is None or history.empty or not {"Project", "Stage"}.issubset(history.columns):
+        return ""
+    target = project_identity(project)
+    subset = history.loc[history["Project"].map(project_identity) == target].copy()
+    if subset.empty:
+        return ""
+    subset = subset.loc[subset["Stage"].fillna("").astype(str).str.strip() != ""]
+    subset = subset.loc[~subset.apply(is_nonconstruction_stage, axis=1)].copy()
+    if subset.empty:
+        return ""
+    subset["_dt"] = pd.to_datetime(subset.get("Issue Date", ""), errors="coerce")
+    subset["_no"] = pd.to_numeric(subset.get("Check Number", ""), errors="coerce")
+    subset["_seq"] = range(len(subset))
+    subset = subset.sort_values(["_dt", "_no", "_seq"], na_position="first")
+    return str(subset.iloc[-1]["Stage"]).strip()
+
+def sync_construction_project_summary():
+    """Refresh one latest construction check per real project from official Sheet1."""
+    history = read_file(GS_SPREADSHEET_NAME, "Sheet1")
+    if history.empty:
+        return
+    result = {}
+    for _, r in history.iterrows():
+        project = str(r.get("Project", "") or "").strip()
+        key = project_identity(project)
+        if not key or key in {"n/a", "-", "new site", "moo housing"} or is_nonconstruction_stage(r):
+            continue
+        if not str(r.get("Stage", "") or "").strip():
+            continue
+        datekey = pd.to_datetime(r.get("Issue Date", ""), errors="coerce")
+        datekey = datekey.isoformat() if pd.notna(datekey) else ""
+        checknum = pd.to_numeric(r.get("Check Number", ""), errors="coerce")
+        sortkey = (datekey, int(checknum) if pd.notna(checknum) else 0)
+        if key not in result or sortkey >= result[key][0]:
+            result[key] = (sortkey, r)
+    gc = get_gc_client()
+    ws = gc.open(GS_SPREADSHEET_NAME).worksheet(GS_CONSTRUCTION_SUMMARY)
+    headings = ["Check Number", "Issue Date", "Company", "Account", "Project", "Stage", "Payee Name", "Amount", "Memo", "PDF Link", "Project ID"]
+    data = [headings] + [[str(rec.get(h, "") if pd.notna(rec.get(h, "")) else "") for h in headings]
+                         for _, rec in sorted(result.values(), key=lambda item: project_identity(item[1].get("Project", "")))]
+    ws.clear()
+    ws.update(range_name=f"A1:K{len(data)}", values=data, value_input_option="RAW")
+
 # ----------------- Stage choices and check memo -----------------
 def stage_code_only(value):
     """Extract the saved stage code from 'CODE (Sub-Stage)' history values."""
     value = str(value or "").strip()
+    if value.casefold() in ("nan", "none"):
+        return ""
     return value.split(" (", 1)[0].strip()
 
 
@@ -1268,6 +1344,7 @@ mode = st.sidebar.radio(
     [
         "📝 Single Mannul Check",
         "👷 Construction Bulk Checks",
+        "🏢 Other Bulk Checks",
     ],
 )
 
@@ -1618,8 +1695,11 @@ if mode == "📝 Single Mannul Check":
 # ==============================================================================
 # 场景 2：多项目/施工队周薪批量开单
 # ==============================================================================
-elif mode == "👷 Construction Bulk Checks":
-    st.title("👷 Construction Bulk Checks")
+elif mode in ("👷 Construction Bulk Checks", "🏢 Other Bulk Checks"):
+    is_other_bulk = mode == "🏢 Other Bulk Checks"
+    st.title(mode)
+    if is_other_bulk:
+        st.info("Other Checks: use Payee, Amount, Company, optional Project/Project ID and Memo in Excel. The paying Company must have a bank profile in the Google Sheets Project tab. Stage can be blank.")
 
 
     pay_date = st.date_input("Date", value=date.today())
@@ -1667,12 +1747,22 @@ elif mode == "👷 Construction Bulk Checks":
 
     import_type = st.radio("Import method", ["Image / PDF (Vision OCR)", "Excel (.xlsx)"], horizontal=True)
     if import_type.startswith("Excel"):
-        st.caption("Upload an exported edited draft or existing Excel. Supports Payee/Amount/Project/Stage/Sub-Stage/Memo and original Payee/Total/Projects format.")
+        st.caption("Upload an exported edited draft or existing Excel. Supports Payee/Amount/Project/Project ID/Stage/Sub-Stage/Memo, including the supplied Check Draft file.")
         weekly_excel = st.file_uploader("Upload Excel", type=["xlsx"], key="weekly_excel_upload")
         if st.button("📊 Import Excel", disabled=weekly_excel is None):
             try:
                 extracted = checklist_rows_from_excel(weekly_excel)
-                install_weekly_review(expand_weekly_rows(extracted, df_projects), title=weekly_excel.name)
+                if is_other_bulk:
+                    for r in extracted:
+                        if not str(r.get("Projects", "") or "").strip():
+                            r["Projects"] = "Other"
+                expanded = expand_weekly_rows(extracted, df_projects)
+                if is_other_bulk:
+                    for r in expanded:
+                        if not r.get("Project"):
+                            r["Project"] = "" if str(r.get("Project Code", "")) == "Other" else str(r.get("Project Code", ""))
+                        r["Status"] = "Ready" if float(r.get("Amount", 0) or 0) > 0 and str(r.get("Payee", "")).strip() else "Review"
+                install_weekly_review(expanded, title=weekly_excel.name)
                 try:
                     save_check_draft(st.session_state.weekly_draft_id, st.session_state.weekly_draft_title,
                                      st.session_state.weekly_review_rows)
@@ -1714,10 +1804,11 @@ elif mode == "👷 Construction Bulk Checks":
                 weekly_df, num_rows="dynamic", hide_index=True,
                 disabled=[c for c in ["Source", "Original Total", "Raw", "Status"] if c in weekly_df.columns],
                 column_config={
-                    "Project": st.column_config.SelectboxColumn("Project", options=[""] + preset_project_list),
+                    "Project": (st.column_config.TextColumn("Project / Property") if is_other_bulk else st.column_config.SelectboxColumn("Project", options=[""] + preset_project_list)),
+                    "Project ID": st.column_config.TextColumn("Project ID"),
                     "Amount": st.column_config.NumberColumn("Amount", min_value=0, format="$%.2f"),
-                    "Stage": st.column_config.TextColumn("Stage code"),
-                    "Sub-Stage": st.column_config.TextColumn("Sub-Stage"),
+                    "Stage": st.column_config.SelectboxColumn("Stage", options=[""] + sorted(set(df_stages["Stage"].astype(str)) | set(weekly_df["Stage"].dropna().astype(str)))),
+                    "Sub-Stage": st.column_config.SelectboxColumn("Sub-Stage", options=[""] + sorted(set(df_stages["Sub_Stage"].dropna().astype(str)) | set(weekly_df["Sub-Stage"].dropna().astype(str)))),
                     "Memo": st.column_config.TextColumn("Memo"),
                 },
                 key=f"weekly_review_editor_{st.session_state.get('weekly_editor_version', 0)}",
@@ -1739,7 +1830,7 @@ elif mode == "👷 Construction Bulk Checks":
                                    file_name=f"check_draft_{st.session_state.get('weekly_draft_id', 'export')}.xlsx",
                                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                                    use_container_width=True)
-            issues = validate_weekly_rows(current_rows, df_projects)
+            issues = validate_weekly_rows(current_rows, df_projects, other_mode=is_other_bulk)
             if issues:
                 st.warning(f"{len(issues)} items to review: " + "; ".join(issues[:8]))
             st.caption("Drafts are not issued checks. Saving a draft never allocates check numbers or writes issuance history.")
@@ -1749,17 +1840,25 @@ elif mode == "👷 Construction Bulk Checks":
                     staged = list(st.session_state.payroll_list)
                     for row in current_rows:
                         project = str(row["Project"])
-                        p = df_projects.loc[df_projects["Project_Name"] == project].iloc[0]
-                        company, account = paying_company(p), str(p["Account"]).strip()
+                        if is_other_bulk:
+                            company = str(row.get("Company", "") or "").strip()
+                            p = payer_profile(company)
+                            if p is None:
+                                raise ValueError(f"Unmatched paying company: {company}")
+                            company, account = paying_company(p), str(p["Account"]).strip()
+                        else:
+                            p = df_projects.loc[df_projects["Project_Name"] == project].iloc[0]
+                            company, account = paying_company(p), str(p["Account"]).strip()
                         ensure_bank(account, project)
                         start = account_start_nums.get(account, 1001)
                         number = next_number_for_account(account, history, staged, start)
-                        prior_stage = latest_stage_for_worker(history, row["Payee"], project)
+                        prior_stage = "" if is_other_bulk else latest_stage_for_project(history, project)
                         stage_code = stage_code_only(row.get("Stage", "")) or stage_code_only(prior_stage)
                         sub_stage = str(row.get("Sub-Stage", "") or "").strip() or (saved_sub_stage(prior_stage) if not str(row.get("Stage", "") or "").strip() else "")
                         explicit_memo = str(row.get("Memo", "") or "").strip()
                         staged.append({"Company": company, "Payee": str(row["Payee"]).strip(),
-                                       "Project": project, "Account": account, "Stage": stage_code,
+                                       "Project": project, "Project ID": str(row.get("Project ID", "") or "").strip().removesuffix(".0"),
+                                       "Account": account, "Stage": stage_code,
                                        "Sub-Stage": sub_stage, "Days": None, "Rate": None,
                                        "Check #": number, "Amount": float(row["Amount"]),
                                        "Memo": explicit_memo or default_memo_for_stage(stage_code, sub_stage, df_stages)})
@@ -1992,7 +2091,8 @@ elif mode == "👷 Construction Bulk Checks":
             column_config={
                 "Company": st.column_config.TextColumn("Company"),
                 "Payee": st.column_config.TextColumn("Payee"),
-                "Project": st.column_config.SelectboxColumn("Project", options=[""] + preset_project_list),
+                "Project": (st.column_config.TextColumn("Project / Property") if is_other_bulk else st.column_config.SelectboxColumn("Project", options=[""] + preset_project_list)),
+                "Project ID": st.column_config.TextColumn("Project ID"),
                 "Check #": st.column_config.NumberColumn("Check #", format="%d"),
                 "Amount": st.column_config.NumberColumn("Amount", format="$%.2f"),
                 "Stage": st.column_config.SelectboxColumn("Stage (latest; selectable)", options=stage_options),
@@ -2099,7 +2199,8 @@ elif mode == "👷 Construction Bulk Checks":
                     "Stage": stage_name,
                     "Payee Name": worker_name,
                     "Amount": amt,
-                    "Memo": full_memo
+                    "Memo": full_memo,
+                    "Project ID": str(row.get("Project ID", "") or "").strip()
                 })
     
             if records_log:
