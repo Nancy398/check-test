@@ -1,5 +1,4 @@
 import base64
-import hashlib
 import json
 from datetime import datetime, timezone
 import uuid
@@ -9,7 +8,6 @@ import os
 import zipfile
 import re
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
-import fitz
 from num2words import num2words
 import pandas as pd
 import streamlit as st
@@ -19,12 +17,11 @@ from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
 from reportlab.lib.utils import ImageReader
-from google.auth.transport.requests import AuthorizedSession
 from collections import defaultdict
 
 
 
-# -------- Weekly checklist import: Google Cloud Vision OCR + manual review --------
+# -------- Weekly checklist import: Excel import + manual review --------
 def checklist_rows_from_excel(upload):
     """Accept old Payee/Total/Projects or direct Payee/Amount/Project Excel.
 
@@ -68,83 +65,6 @@ def checklist_rows_from_excel(upload):
     if not parsed:
         raise ValueError("No worker rows found in Excel.")
     return parsed
-
-
-def checklist_ocr(upload):
-    """Read an image or scanned PDF with Google Cloud Vision (must be enabled in GCP)."""
-    raw = upload.getvalue()
-    images = []
-    if upload.name.lower().endswith(".pdf"):
-        doc = fitz.open(stream=raw, filetype="pdf")
-        if len(doc) > 10:
-            raise ValueError("Please upload no more than 10 PDF pages at a time.")
-        for page in doc:
-            images.append(page.get_pixmap(matrix=fitz.Matrix(1.5, 1.5), alpha=False).tobytes("png"))
-        doc.close()
-    else:
-        images = [raw]
-    creds_dict = dict(st.secrets["GOOGLE_APPLICATION_CREDENTIALS"])
-    creds_dict["private_key"] = creds_dict["private_key"].replace("\\n", "\n")
-    creds = Credentials.from_service_account_info(creds_dict, scopes=["https://www.googleapis.com/auth/cloud-platform"])
-    session = AuthorizedSession(creds)
-    parsed = []
-    for image_bytes in images:
-        payload = {"requests": [{"image": {"content": base64.b64encode(image_bytes).decode("ascii")},
-                                "features": [{"type": "DOCUMENT_TEXT_DETECTION"}]}]}
-        response = session.post("https://vision.googleapis.com/v1/images:annotate", json=payload, timeout=60)
-        if not response.ok:
-            raise RuntimeError(f"Cloud Vision error {response.status_code}: {response.text[:350]}")
-        result = response.json()["responses"][0]
-        if result.get("error"):
-            raise RuntimeError(result["error"].get("message", "Cloud Vision failed"))
-        parsed.extend(checklist_rows_from_vision(result))
-    return parsed
-
-
-def checklist_rows_from_vision(result):
-    """Reconstruct checklist rows from OCR word coordinates, preserving separate occurrences."""
-    extracted = []
-    for page in result.get("fullTextAnnotation", {}).get("pages", []):
-        words = []
-        for block in page.get("blocks", []):
-            for para in block.get("paragraphs", []):
-                for word in para.get("words", []):
-                    txt = "".join(c.get("text", "") for c in word.get("symbols", []))
-                    verts = word.get("boundingBox", {}).get("vertices", [])
-                    if not verts or not txt:
-                        continue
-                    x = min(v.get("x", 0) for v in verts)
-                    y = sum(v.get("y", 0) for v in verts) / len(verts)
-                    height = max(v.get("y", 0) for v in verts) - min(v.get("y", 0) for v in verts)
-                    words.append((x, y, max(height, 8), txt))
-        if not words:
-            continue
-        page_width = page.get("width", 1)
-        lines = []
-        for x, y, h, txt in sorted(words, key=lambda v: v[1]):
-            closest = min(lines, key=lambda line: abs(line["y"] - y), default=None)
-            if closest and abs(closest["y"] - y) <= max(9, min(20, h * .6)):
-                closest["words"].append((x, txt))
-                closest["y"] = (closest["y"] * (len(closest["words"]) - 1) + y) / len(closest["words"])
-            else:
-                lines.append({"y": y, "words": [(x, txt)]})
-        for line in sorted(lines, key=lambda l: l["y"]):
-            chunks = [[], [], []]
-            for x, txt in sorted(line["words"]):
-                col = 0 if x < page_width * .51 else (1 if x < page_width * .76 else 2)
-                chunks[col].append(txt)
-            name, amount, project = (" ".join(c).strip() for c in chunks)
-            name = name.rstrip(" .:")
-            amount_match = re.search(r"\d[\d,]*(?:\.\d{1,2})?", amount.replace(" ", ""))
-            amount_value = amount_match.group(0).replace(",", "") if amount_match else ""
-            if len(name) < 3 or not re.search(r"[A-Za-z]", name):
-                continue
-            if name.lower() in ("name", "worker", "frank workers"):
-                continue
-            # Include uncertain rows for human review rather than silently dropping them.
-            extracted.append({"Payee": name, "Total": amount_value, "Projects": project,
-                              "Raw": " | ".join([name, amount, project])})
-    return extracted
 
 
 def resolve_checklist_project(token, projects):
@@ -290,6 +210,7 @@ GS_WORKSHEET_NAME = "Sheet1"  # Official issuance history; do not use the summar
 GS_CONSTRUCTION_SUMMARY = "Construction Check"
 
 # ----------------- 1. 获取 Authorization 客户端 -----------------
+@st.cache_resource
 def get_gc_client():
     scope = [
         "https://www.googleapis.com/auth/spreadsheets",
@@ -303,6 +224,10 @@ def get_gc_client():
     return gspread.authorize(credentials)
 
 # ----------------- 2. 读取 Google Sheets -----------------
+@st.cache_data(ttl=120, show_spinner=False)
+def read_reference_file(name, sheet):
+    return read_file(name, sheet)
+
 def read_file(name, sheet):
     try:
         gc = get_gc_client()
@@ -344,12 +269,10 @@ def save_to_history(records):
         st.error(f"❌ 数据保存至 Google Sheets 失败: {e}")
         return False
 
-# ----------------- OCR cache + persistent editable drafts -----------------
+# ----------------- Persistent editable drafts -----------------
 # Sheets are intentionally separate from issued-check history. No draft is issued.
 DRAFT_SHEET = "Check Drafts"
-OCR_CACHE_SHEET = "Checklist OCR Cache"
 DRAFT_HEADERS = ["Draft ID", "Updated At UTC", "Title", "Rows JSON"]
-CACHE_HEADERS = ["SHA256", "Saved At UTC", "Filename", "Rows JSON"]
 
 
 def _storage_ws(name, headers):
@@ -415,28 +338,6 @@ def read_check_draft(draft_id):
     return json.loads(matches[0]["Rows JSON"])
 
 
-def read_ocr_cache(digest):
-    ws = _storage_ws(OCR_CACHE_SHEET, CACHE_HEADERS)
-    records = ws.get_all_records()
-    for rec in reversed(records):
-        if str(rec.get("SHA256", "")) == digest:
-            return json.loads(rec.get("Rows JSON", "[]"))
-    return None
-
-
-def get_or_create_ocr(upload):
-    # Hash is of exact file bytes: upload again = no Vision API request.
-    digest = hashlib.sha256(upload.getvalue()).hexdigest()
-    cached = read_ocr_cache(digest)
-    if cached is not None:
-        return cached, True
-    extracted = checklist_ocr(upload)
-    # Write the raw OCR results before the user begins editing.
-    _append_json_record(OCR_CACHE_SHEET, CACHE_HEADERS,
-                        [digest, _utc(), upload.name], extracted)
-    return extracted, False
-
-
 def draft_excel_bytes(rows):
     df = pd.DataFrame(_json_safe_rows(rows))
     export = pd.DataFrame({
@@ -450,7 +351,7 @@ def draft_excel_bytes(rows):
         "Company": df.get("Company", pd.Series(dtype=str)),
         "Check Type": df.get("Check Type", pd.Series(dtype=str)),
     })
-    # Preserve ambiguous OCR project codes for offline correction.
+    # Preserve ambiguous project codes for offline correction.
     if "Project Code" in df.columns:
         missing = export["Project"].fillna("").astype(str).str.strip() == ""
         export.loc[missing, "Project"] = df.loc[missing, "Project Code"]
@@ -732,7 +633,7 @@ def auto_match_stage(worker_name, project_name, default_stg, default_stg_name, d
 # ----------------- 6. 数据预设加载函数 -----------------
 @st.cache_data(ttl=60)
 def load_project_presets():
-    df_p = read_file(GS_SPREADSHEET_NAME, "Project")
+    df_p = read_reference_file(GS_SPREADSHEET_NAME, "Project")
     
     # Construction projects/accounts come exclusively from the Google Sheet.
     # Keep Moo Housing's ACC-* aliases elsewhere in the app.
@@ -848,7 +749,7 @@ def bank_from_project(alias, project=""):
         return result
 
     # Read the complete Project sheet so duplicate project names cannot hide bank fields.
-    raw_projects = read_file(GS_SPREADSHEET_NAME, "Project")
+    raw_projects = read_reference_file(GS_SPREADSHEET_NAME, "Project")
     source = raw_projects if not raw_projects.empty and "Account" in raw_projects.columns else df_projects
     matches = source.loc[
         source["Account"].fillna("").astype(str).str.strip() == alias
@@ -1187,7 +1088,7 @@ def payer_profile(name):
 
 def moo_development_salary_account():
     """Use the actual Account in Project sheet for Moo Development LLC, never a hardcoded alias."""
-    source = read_file(GS_SPREADSHEET_NAME, "Project")
+    source = read_reference_file(GS_SPREADSHEET_NAME, "Project")
     if source.empty or "Account" not in source.columns:
         return ""
     for column in ("Company_Name", "Company"):
@@ -1726,12 +1627,14 @@ elif mode in ("👷 Construction Bulk Checks", "🏢 Other Bulk Checks"):
     if "payroll_list" not in st.session_state:
         st.session_state.payroll_list = []
 
-    st.markdown("### 📋 Image → OCR → Saved Draft → Excel / Checks")
-    st.caption("Images are recognized only on explicit request. Recognition results are cached by file hash in Google Sheets; reviewing, editing, downloading, or reloading does NOT call Vision API.")
+    st.markdown("### 📋 Excel → Saved Draft → Checks")
+    st.caption("Upload an Excel checklist, review the rows, then generate checks.")
 
     with st.expander("📂 Open a previously saved draft", expanded=False):
         try:
-            existing_drafts = list_saved_drafts()
+            if st.button("Refresh saved drafts", key="refresh_saved_drafts"):
+                st.session_state.saved_draft_list = list_saved_drafts()
+            existing_drafts = st.session_state.get("saved_draft_list", [])
             if existing_drafts:
                 choices = {f"{r['Title']} | {r['Updated At UTC']} UTC | {r['Draft ID']}": str(r['Draft ID']) for r in existing_drafts}
                 chosen = st.selectbox("Saved drafts (newest first)", options=list(choices))
@@ -1741,60 +1644,37 @@ elif mode in ("👷 Construction Bulk Checks", "🏢 Other Bulk Checks"):
                                           next(r["Title"] for r in existing_drafts if str(r["Draft ID"]) == selected_id))
                     st.rerun()
             else:
-                st.info("No saved drafts yet.")
+                st.info("Click Refresh saved drafts to load saved drafts.")
         except Exception as exc:
             st.warning(f"Cannot list saved drafts: {exc}")
 
-    import_type = st.radio("Import method", ["Image / PDF (Vision OCR)", "Excel (.xlsx)"], horizontal=True)
-    if import_type.startswith("Excel"):
-        st.caption("Upload an exported edited draft or existing Excel. Supports Payee/Amount/Project/Project ID/Stage/Sub-Stage/Memo, including the supplied Check Draft file.")
-        weekly_excel = st.file_uploader("Upload Excel", type=["xlsx"], key="weekly_excel_upload")
-        if st.button("📊 Import Excel", disabled=weekly_excel is None):
+    st.caption("Upload an exported edited draft or existing Excel. Supports Payee/Amount/Project/Project ID/Stage/Sub-Stage/Memo, including the supplied Check Draft file.")
+    weekly_excel = st.file_uploader("Upload Excel", type=["xlsx"], key="weekly_excel_upload")
+    if st.button("📊 Import Excel", disabled=weekly_excel is None):
+        try:
+            extracted = checklist_rows_from_excel(weekly_excel)
+            if is_other_bulk:
+                for r in extracted:
+                    if not str(r.get("Projects", "") or "").strip():
+                        r["Projects"] = "Other"
+            expanded = expand_weekly_rows(extracted, df_projects)
+            if is_other_bulk:
+                for r in expanded:
+                    if not r.get("Project"):
+                        r["Project"] = "" if str(r.get("Project Code", "")) == "Other" else str(r.get("Project Code", ""))
+                    r["Status"] = "Ready" if float(r.get("Amount", 0) or 0) > 0 and str(r.get("Payee", "")).strip() else "Review"
+            install_weekly_review(expanded, title=weekly_excel.name)
             try:
-                extracted = checklist_rows_from_excel(weekly_excel)
-                if is_other_bulk:
-                    for r in extracted:
-                        if not str(r.get("Projects", "") or "").strip():
-                            r["Projects"] = "Other"
-                expanded = expand_weekly_rows(extracted, df_projects)
-                if is_other_bulk:
-                    for r in expanded:
-                        if not r.get("Project"):
-                            r["Project"] = "" if str(r.get("Project Code", "")) == "Other" else str(r.get("Project Code", ""))
-                        r["Status"] = "Ready" if float(r.get("Amount", 0) or 0) > 0 and str(r.get("Payee", "")).strip() else "Review"
-                install_weekly_review(expanded, title=weekly_excel.name)
-                try:
-                    save_check_draft(st.session_state.weekly_draft_id, st.session_state.weekly_draft_title,
-                                     st.session_state.weekly_review_rows)
-                    st.success(f"Imported {len(extracted)} rows and auto-saved a draft.")
-                except Exception as save_exc:
-                    st.warning(f"Imported {len(extracted)} rows, but draft auto-save failed: {save_exc}. Download Excel to avoid losing edits.")
-            except Exception as exc:
-                st.error(f"Excel import failed: {exc}")
-    else:
-        weekly_files = st.file_uploader("Weekly checklist images / PDF", type=["png", "jpg", "jpeg", "pdf"], accept_multiple_files=True, key="weekly_checklist_upload")
-        if st.button("🔍 Recognize images (only if uncached)", disabled=not weekly_files):
-            try:
-                extracted = []
-                cache_hits = 0
-                for uploaded in weekly_files:
-                    rows, was_cached = get_or_create_ocr(uploaded)
-                    extracted.extend(rows)
-                    cache_hits += int(was_cached)
-                install_weekly_review(expand_weekly_rows(extracted, df_projects),
-                                      title=" / ".join(x.name for x in weekly_files)[:100])
-                try:
-                    save_check_draft(st.session_state.weekly_draft_id, st.session_state.weekly_draft_title,
-                                     st.session_state.weekly_review_rows)
-                    st.success(f"Recognized {len(extracted)} potential rows and auto-saved a draft. {cache_hits}/{len(weekly_files)} files came from cache without OCR API requests.")
-                except Exception as save_exc:
-                    st.warning(f"Recognized {len(extracted)} rows, but draft auto-save failed: {save_exc}. Download Excel to avoid losing edits.")
-            except Exception as exc:
-                st.error(f"Recognition/cache error: {exc}")
-                st.info("If the Google Sheets cache cannot be accessed, the image is not processed; this avoids accidental repeated API charges.")
+                save_check_draft(st.session_state.weekly_draft_id, st.session_state.weekly_draft_title,
+                                 st.session_state.weekly_review_rows)
+                st.success(f"Imported {len(extracted)} rows and auto-saved a draft.")
+            except Exception as save_exc:
+                st.warning(f"Imported {len(extracted)} rows, but draft auto-save failed: {save_exc}. Download Excel to avoid losing edits.")
+        except Exception as exc:
+            st.error(f"Excel import failed: {exc}")
 
     if st.session_state.get("weekly_review_rows") is not None:
-        st.markdown("#### ✏️ Editable Draft — no OCR API calls")
+        st.markdown("#### ✏️ Editable Draft")
         weekly_df = pd.DataFrame(st.session_state.weekly_review_rows)
         if not weekly_df.empty:
             if "Stage" not in weekly_df.columns: weekly_df["Stage"] = ""
@@ -1822,7 +1702,7 @@ elif mode in ("👷 Construction Bulk Checks", "🏢 Other Bulk Checks"):
                     try:
                         save_check_draft(st.session_state.weekly_draft_id,
                                          st.session_state.weekly_draft_title, current_rows)
-                        st.success("Draft saved. Reopen it later from Saved Drafts; no OCR rerun needed.")
+                        st.success("Draft saved. Reopen it later from Saved Drafts.")
                     except Exception as exc:
                         st.error(f"Draft save failed: {exc}")
             with col_download:
