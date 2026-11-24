@@ -1,4 +1,5 @@
 import base64
+import hashlib
 import json
 from datetime import datetime, timezone
 import uuid
@@ -8,6 +9,7 @@ import os
 import zipfile
 import re
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+import fitz
 from num2words import num2words
 import pandas as pd
 import streamlit as st
@@ -17,11 +19,12 @@ from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
 from reportlab.lib.utils import ImageReader
+from google.auth.transport.requests import AuthorizedSession
 from collections import defaultdict
 
 
 
-# -------- Weekly checklist import: Excel import + manual review --------
+# -------- Weekly checklist import: Google Cloud Vision OCR + manual review --------
 def checklist_rows_from_excel(upload):
     """Accept old Payee/Total/Projects or direct Payee/Amount/Project Excel.
 
@@ -65,6 +68,83 @@ def checklist_rows_from_excel(upload):
     if not parsed:
         raise ValueError("No worker rows found in Excel.")
     return parsed
+
+
+def checklist_ocr(upload):
+    """Read an image or scanned PDF with Google Cloud Vision (must be enabled in GCP)."""
+    raw = upload.getvalue()
+    images = []
+    if upload.name.lower().endswith(".pdf"):
+        doc = fitz.open(stream=raw, filetype="pdf")
+        if len(doc) > 10:
+            raise ValueError("Please upload no more than 10 PDF pages at a time.")
+        for page in doc:
+            images.append(page.get_pixmap(matrix=fitz.Matrix(1.5, 1.5), alpha=False).tobytes("png"))
+        doc.close()
+    else:
+        images = [raw]
+    creds_dict = dict(st.secrets["GOOGLE_APPLICATION_CREDENTIALS"])
+    creds_dict["private_key"] = creds_dict["private_key"].replace("\\n", "\n")
+    creds = Credentials.from_service_account_info(creds_dict, scopes=["https://www.googleapis.com/auth/cloud-platform"])
+    session = AuthorizedSession(creds)
+    parsed = []
+    for image_bytes in images:
+        payload = {"requests": [{"image": {"content": base64.b64encode(image_bytes).decode("ascii")},
+                                "features": [{"type": "DOCUMENT_TEXT_DETECTION"}]}]}
+        response = session.post("https://vision.googleapis.com/v1/images:annotate", json=payload, timeout=60)
+        if not response.ok:
+            raise RuntimeError(f"Cloud Vision error {response.status_code}: {response.text[:350]}")
+        result = response.json()["responses"][0]
+        if result.get("error"):
+            raise RuntimeError(result["error"].get("message", "Cloud Vision failed"))
+        parsed.extend(checklist_rows_from_vision(result))
+    return parsed
+
+
+def checklist_rows_from_vision(result):
+    """Reconstruct checklist rows from OCR word coordinates, preserving separate occurrences."""
+    extracted = []
+    for page in result.get("fullTextAnnotation", {}).get("pages", []):
+        words = []
+        for block in page.get("blocks", []):
+            for para in block.get("paragraphs", []):
+                for word in para.get("words", []):
+                    txt = "".join(c.get("text", "") for c in word.get("symbols", []))
+                    verts = word.get("boundingBox", {}).get("vertices", [])
+                    if not verts or not txt:
+                        continue
+                    x = min(v.get("x", 0) for v in verts)
+                    y = sum(v.get("y", 0) for v in verts) / len(verts)
+                    height = max(v.get("y", 0) for v in verts) - min(v.get("y", 0) for v in verts)
+                    words.append((x, y, max(height, 8), txt))
+        if not words:
+            continue
+        page_width = page.get("width", 1)
+        lines = []
+        for x, y, h, txt in sorted(words, key=lambda v: v[1]):
+            closest = min(lines, key=lambda line: abs(line["y"] - y), default=None)
+            if closest and abs(closest["y"] - y) <= max(9, min(20, h * .6)):
+                closest["words"].append((x, txt))
+                closest["y"] = (closest["y"] * (len(closest["words"]) - 1) + y) / len(closest["words"])
+            else:
+                lines.append({"y": y, "words": [(x, txt)]})
+        for line in sorted(lines, key=lambda l: l["y"]):
+            chunks = [[], [], []]
+            for x, txt in sorted(line["words"]):
+                col = 0 if x < page_width * .51 else (1 if x < page_width * .76 else 2)
+                chunks[col].append(txt)
+            name, amount, project = (" ".join(c).strip() for c in chunks)
+            name = name.rstrip(" .:")
+            amount_match = re.search(r"\d[\d,]*(?:\.\d{1,2})?", amount.replace(" ", ""))
+            amount_value = amount_match.group(0).replace(",", "") if amount_match else ""
+            if len(name) < 3 or not re.search(r"[A-Za-z]", name):
+                continue
+            if name.lower() in ("name", "worker", "frank workers"):
+                continue
+            # Include uncertain rows for human review rather than silently dropping them.
+            extracted.append({"Payee": name, "Total": amount_value, "Projects": project,
+                              "Raw": " | ".join([name, amount, project])})
+    return extracted
 
 
 def resolve_checklist_project(token, projects):
@@ -206,11 +286,10 @@ st.set_page_config(
 # ----------------- 配置文件与路径定义 -----------------
 
 GS_SPREADSHEET_NAME = "Check Issuance History"  # Google 表格的名字
-GS_WORKSHEET_NAME = "Sheet1"  # Official issuance history; do not use the summary tab for check numbering
-GS_CONSTRUCTION_SUMMARY = "Construction Check"
+GS_WORKSHEET_NAME = "Construction Check"  # Save ALL issued checks here, not a summary
+LEGACY_HISTORY_SHEET = "Sheet1"  # Read-only legacy data, still used when checking numbers
 
 # ----------------- 1. 获取 Authorization 客户端 -----------------
-@st.cache_resource
 def get_gc_client():
     scope = [
         "https://www.googleapis.com/auth/spreadsheets",
@@ -224,10 +303,6 @@ def get_gc_client():
     return gspread.authorize(credentials)
 
 # ----------------- 2. 读取 Google Sheets -----------------
-@st.cache_data(ttl=120, show_spinner=False)
-def read_reference_file(name, sheet):
-    return read_file(name, sheet)
-
 def read_file(name, sheet):
     try:
         gc = get_gc_client()
@@ -243,36 +318,51 @@ def read_file(name, sheet):
         st.error(f"❌ 读取 Google Sheets ({sheet}) 失败: {e}")
         return pd.DataFrame()
 
+def read_issuance_history():
+    """Include old Sheet1 checks when allocating numbers or finding prior stages."""
+    current = read_file(GS_SPREADSHEET_NAME, GS_WORKSHEET_NAME)
+    legacy = read_file(GS_SPREADSHEET_NAME, LEGACY_HISTORY_SHEET)
+    if current.empty:
+        return legacy
+    if legacy.empty:
+        return current
+    return pd.concat([legacy, current], ignore_index=True, sort=False)
+
+
 # ----------------- 3. 保存写入 Google Sheets -----------------
 def save_to_history(records):
-    """把生成的支票记录直接追加保存到 Google Sheets 中"""
+    """Save issued checks to Construction Check using its existing column headers."""
     try:
         gc = get_gc_client()
         worksheet = gc.open(GS_SPREADSHEET_NAME).worksheet(GS_WORKSHEET_NAME)
-        
-        rows_to_append = []
+        headers = worksheet.row_values(1)
+        for extra in ("PDF Link", "Project ID"):
+            if extra not in headers:
+                worksheet.update_cell(1, len(headers) + 1, extra)
+                headers.append(extra)
+        data = []
         for r in records:
-            rows_to_append.append([
-                r["Check Number"],
-                r["Issue Date"],
-                r["Company"],
-                r["Account"],
-                r["Project"],
-                r.get("Stage", ""),
-                r["Payee Name"],
-                r["Amount"],
-                r["Memo"]
-            ])
-        worksheet.append_rows(rows_to_append)
+            fields = {
+                "Check Number": r["Check Number"], "Issue Date": r["Issue Date"],
+                "Company": r["Company"], "Account": r["Account"],
+                "Project": r["Project"], "Stage": r.get("Stage", ""),
+                "Payee Name": r["Payee Name"], "Amount": r["Amount"],
+                "Memo": r["Memo"], "Project ID": r.get("Project ID", ""),
+                "PDF Link": r.get("PDF Link", ""),
+            }
+            data.append([fields.get(h, "") for h in headers])
+        worksheet.append_rows(data, value_input_option="USER_ENTERED")
         return True
     except Exception as e:
-        st.error(f"❌ 数据保存至 Google Sheets 失败: {e}")
+        st.error(f"❌ Failed to save to Construction Check: {e}")
         return False
 
-# ----------------- Persistent editable drafts -----------------
+# ----------------- OCR cache + persistent editable drafts -----------------
 # Sheets are intentionally separate from issued-check history. No draft is issued.
 DRAFT_SHEET = "Check Drafts"
+OCR_CACHE_SHEET = "Checklist OCR Cache"
 DRAFT_HEADERS = ["Draft ID", "Updated At UTC", "Title", "Rows JSON"]
+CACHE_HEADERS = ["SHA256", "Saved At UTC", "Filename", "Rows JSON"]
 
 
 def _storage_ws(name, headers):
@@ -338,6 +428,28 @@ def read_check_draft(draft_id):
     return json.loads(matches[0]["Rows JSON"])
 
 
+def read_ocr_cache(digest):
+    ws = _storage_ws(OCR_CACHE_SHEET, CACHE_HEADERS)
+    records = ws.get_all_records()
+    for rec in reversed(records):
+        if str(rec.get("SHA256", "")) == digest:
+            return json.loads(rec.get("Rows JSON", "[]"))
+    return None
+
+
+def get_or_create_ocr(upload):
+    # Hash is of exact file bytes: upload again = no Vision API request.
+    digest = hashlib.sha256(upload.getvalue()).hexdigest()
+    cached = read_ocr_cache(digest)
+    if cached is not None:
+        return cached, True
+    extracted = checklist_ocr(upload)
+    # Write the raw OCR results before the user begins editing.
+    _append_json_record(OCR_CACHE_SHEET, CACHE_HEADERS,
+                        [digest, _utc(), upload.name], extracted)
+    return extracted, False
+
+
 def draft_excel_bytes(rows):
     df = pd.DataFrame(_json_safe_rows(rows))
     export = pd.DataFrame({
@@ -351,7 +463,7 @@ def draft_excel_bytes(rows):
         "Company": df.get("Company", pd.Series(dtype=str)),
         "Check Type": df.get("Check Type", pd.Series(dtype=str)),
     })
-    # Preserve ambiguous project codes for offline correction.
+    # Preserve ambiguous OCR project codes for offline correction.
     if "Project Code" in df.columns:
         missing = export["Project"].fillna("").astype(str).str.strip() == ""
         export.loc[missing, "Project"] = df.loc[missing, "Project Code"]
@@ -458,7 +570,7 @@ def upload_all_checks_pdf_to_drive(pdf_data, issue_date, records, filename_label
 
 
 def save_batch_with_pdf_links(records, pdf_urls):
-    """Append check history and the corresponding merged PDF link in one batch."""
+    """Append each issued check and merged PDF link to Construction Check."""
     try:
         gc = get_gc_client()
         ws = gc.open(GS_SPREADSHEET_NAME).worksheet(GS_WORKSHEET_NAME)
@@ -479,10 +591,6 @@ def save_batch_with_pdf_links(records, pdf_urls):
             }
             data.append([fields.get(h, "") for h in headers])
         ws.append_rows(data, value_input_option="USER_ENTERED")
-        try:
-            sync_construction_project_summary()
-        except Exception as summary_exc:
-            st.warning(f"Checks saved to Sheet1, but Construction Check summary refresh failed: {summary_exc}")
         return True
     except Exception as e:
         st.error(f"❌ Failed to save history/PDF links to Google Sheets: {e}")
@@ -544,33 +652,6 @@ def latest_stage_for_project(history, project):
     subset = subset.sort_values(["_dt", "_no", "_seq"], na_position="first")
     return str(subset.iloc[-1]["Stage"]).strip()
 
-def sync_construction_project_summary():
-    """Refresh one latest construction check per real project from official Sheet1."""
-    history = read_file(GS_SPREADSHEET_NAME, "Sheet1")
-    if history.empty:
-        return
-    result = {}
-    for _, r in history.iterrows():
-        project = str(r.get("Project", "") or "").strip()
-        key = project_identity(project)
-        if not key or key in {"n/a", "-", "new site", "moo housing"} or is_nonconstruction_stage(r):
-            continue
-        if not str(r.get("Stage", "") or "").strip():
-            continue
-        datekey = pd.to_datetime(r.get("Issue Date", ""), errors="coerce")
-        datekey = datekey.isoformat() if pd.notna(datekey) else ""
-        checknum = pd.to_numeric(r.get("Check Number", ""), errors="coerce")
-        sortkey = (datekey, int(checknum) if pd.notna(checknum) else 0)
-        if key not in result or sortkey >= result[key][0]:
-            result[key] = (sortkey, r)
-    gc = get_gc_client()
-    ws = gc.open(GS_SPREADSHEET_NAME).worksheet(GS_CONSTRUCTION_SUMMARY)
-    headings = ["Check Number", "Issue Date", "Company", "Account", "Project", "Stage", "Payee Name", "Amount", "Memo", "PDF Link", "Project ID"]
-    data = [headings] + [[str(rec.get(h, "") if pd.notna(rec.get(h, "")) else "") for h in headings]
-                         for _, rec in sorted(result.values(), key=lambda item: project_identity(item[1].get("Project", "")))]
-    ws.clear()
-    ws.update(range_name=f"A1:K{len(data)}", values=data, value_input_option="RAW")
-
 # ----------------- Stage choices and check memo -----------------
 def stage_code_only(value):
     """Extract the saved stage code from 'CODE (Sub-Stage)' history values."""
@@ -612,7 +693,7 @@ def format_check_memo(project, detail):
 # ----------------- 4. 计算最新可用支票号 -----------------
 def fetch_next_check_numbers_from_gs(accounts, default_start_number=1001):
     """Fetch next check number keyed by Account, never by Project or Company."""
-    history = read_file(GS_SPREADSHEET_NAME, GS_WORKSHEET_NAME)
+    history = read_issuance_history()
     return {str(account).strip(): next_number_for_account(str(account).strip(), history, start=default_start_number)
             for account in accounts if str(account).strip()}
 
@@ -633,7 +714,7 @@ def auto_match_stage(worker_name, project_name, default_stg, default_stg_name, d
 # ----------------- 6. 数据预设加载函数 -----------------
 @st.cache_data(ttl=60)
 def load_project_presets():
-    df_p = read_reference_file(GS_SPREADSHEET_NAME, "Project")
+    df_p = read_file(GS_SPREADSHEET_NAME, "Project")
     
     # Construction projects/accounts come exclusively from the Google Sheet.
     # Keep Moo Housing's ACC-* aliases elsewhere in the app.
@@ -749,7 +830,7 @@ def bank_from_project(alias, project=""):
         return result
 
     # Read the complete Project sheet so duplicate project names cannot hide bank fields.
-    raw_projects = read_reference_file(GS_SPREADSHEET_NAME, "Project")
+    raw_projects = read_file(GS_SPREADSHEET_NAME, "Project")
     source = raw_projects if not raw_projects.empty and "Account" in raw_projects.columns else df_projects
     matches = source.loc[
         source["Account"].fillna("").astype(str).str.strip() == alias
@@ -1088,7 +1169,7 @@ def payer_profile(name):
 
 def moo_development_salary_account():
     """Use the actual Account in Project sheet for Moo Development LLC, never a hardcoded alias."""
-    source = read_reference_file(GS_SPREADSHEET_NAME, "Project")
+    source = read_file(GS_SPREADSHEET_NAME, "Project")
     if source.empty or "Account" not in source.columns:
         return ""
     for column in ("Company_Name", "Company"):
@@ -1105,7 +1186,7 @@ def moo_development_salary_account():
 
 valente_salary_account = moo_development_salary_account()
 
-check_history = read_file(GS_SPREADSHEET_NAME, GS_WORKSHEET_NAME)
+check_history = read_issuance_history()
 all_account_aliases = sorted(set(df_projects["Account"].dropna().astype(str).str.strip()) if "Account" in df_projects.columns else set())
 # Construction: only actual Account values from the Project sheet.
 # Moo Housing retains its legacy ACC-* choices independently.
@@ -1535,7 +1616,7 @@ if mode == "📝 Single Mannul Check":
 
         def handle_sync_and_download():
             """Archive the single-check PDF first, then save its Drive link to history."""
-            fresh_history = read_file(GS_SPREADSHEET_NAME, GS_WORKSHEET_NAME)
+            fresh_history = read_issuance_history()
             if int(check_num) in used_numbers_for_account(account_num, fresh_history):
                 st.session_state["sync_error_msg"] = f"Check #{check_num} already exists for Account {account_num}; nothing was saved."
                 return
@@ -1627,14 +1708,12 @@ elif mode in ("👷 Construction Bulk Checks", "🏢 Other Bulk Checks"):
     if "payroll_list" not in st.session_state:
         st.session_state.payroll_list = []
 
-    st.markdown("### 📋 Excel → Saved Draft → Checks")
-    st.caption("Upload an Excel checklist, review the rows, then generate checks.")
+    st.markdown("### 📋 Image → OCR → Saved Draft → Excel / Checks")
+    st.caption("Images are recognized only on explicit request. Recognition results are cached by file hash in Google Sheets; reviewing, editing, downloading, or reloading does NOT call Vision API.")
 
     with st.expander("📂 Open a previously saved draft", expanded=False):
         try:
-            if st.button("Refresh saved drafts", key="refresh_saved_drafts"):
-                st.session_state.saved_draft_list = list_saved_drafts()
-            existing_drafts = st.session_state.get("saved_draft_list", [])
+            existing_drafts = list_saved_drafts()
             if existing_drafts:
                 choices = {f"{r['Title']} | {r['Updated At UTC']} UTC | {r['Draft ID']}": str(r['Draft ID']) for r in existing_drafts}
                 chosen = st.selectbox("Saved drafts (newest first)", options=list(choices))
@@ -1644,37 +1723,60 @@ elif mode in ("👷 Construction Bulk Checks", "🏢 Other Bulk Checks"):
                                           next(r["Title"] for r in existing_drafts if str(r["Draft ID"]) == selected_id))
                     st.rerun()
             else:
-                st.info("Click Refresh saved drafts to load saved drafts.")
+                st.info("No saved drafts yet.")
         except Exception as exc:
             st.warning(f"Cannot list saved drafts: {exc}")
 
-    st.caption("Upload an exported edited draft or existing Excel. Supports Payee/Amount/Project/Project ID/Stage/Sub-Stage/Memo, including the supplied Check Draft file.")
-    weekly_excel = st.file_uploader("Upload Excel", type=["xlsx"], key="weekly_excel_upload")
-    if st.button("📊 Import Excel", disabled=weekly_excel is None):
-        try:
-            extracted = checklist_rows_from_excel(weekly_excel)
-            if is_other_bulk:
-                for r in extracted:
-                    if not str(r.get("Projects", "") or "").strip():
-                        r["Projects"] = "Other"
-            expanded = expand_weekly_rows(extracted, df_projects)
-            if is_other_bulk:
-                for r in expanded:
-                    if not r.get("Project"):
-                        r["Project"] = "" if str(r.get("Project Code", "")) == "Other" else str(r.get("Project Code", ""))
-                    r["Status"] = "Ready" if float(r.get("Amount", 0) or 0) > 0 and str(r.get("Payee", "")).strip() else "Review"
-            install_weekly_review(expanded, title=weekly_excel.name)
+    import_type = st.radio("Import method", ["Image / PDF (Vision OCR)", "Excel (.xlsx)"], horizontal=True)
+    if import_type.startswith("Excel"):
+        st.caption("Upload an exported edited draft or existing Excel. Supports Payee/Amount/Project/Project ID/Stage/Sub-Stage/Memo, including the supplied Check Draft file.")
+        weekly_excel = st.file_uploader("Upload Excel", type=["xlsx"], key="weekly_excel_upload")
+        if st.button("📊 Import Excel", disabled=weekly_excel is None):
             try:
-                save_check_draft(st.session_state.weekly_draft_id, st.session_state.weekly_draft_title,
-                                 st.session_state.weekly_review_rows)
-                st.success(f"Imported {len(extracted)} rows and auto-saved a draft.")
-            except Exception as save_exc:
-                st.warning(f"Imported {len(extracted)} rows, but draft auto-save failed: {save_exc}. Download Excel to avoid losing edits.")
-        except Exception as exc:
-            st.error(f"Excel import failed: {exc}")
+                extracted = checklist_rows_from_excel(weekly_excel)
+                if is_other_bulk:
+                    for r in extracted:
+                        if not str(r.get("Projects", "") or "").strip():
+                            r["Projects"] = "Other"
+                expanded = expand_weekly_rows(extracted, df_projects)
+                if is_other_bulk:
+                    for r in expanded:
+                        if not r.get("Project"):
+                            r["Project"] = "" if str(r.get("Project Code", "")) == "Other" else str(r.get("Project Code", ""))
+                        r["Status"] = "Ready" if float(r.get("Amount", 0) or 0) > 0 and str(r.get("Payee", "")).strip() else "Review"
+                install_weekly_review(expanded, title=weekly_excel.name)
+                try:
+                    save_check_draft(st.session_state.weekly_draft_id, st.session_state.weekly_draft_title,
+                                     st.session_state.weekly_review_rows)
+                    st.success(f"Imported {len(extracted)} rows and auto-saved a draft.")
+                except Exception as save_exc:
+                    st.warning(f"Imported {len(extracted)} rows, but draft auto-save failed: {save_exc}. Download Excel to avoid losing edits.")
+            except Exception as exc:
+                st.error(f"Excel import failed: {exc}")
+    else:
+        weekly_files = st.file_uploader("Weekly checklist images / PDF", type=["png", "jpg", "jpeg", "pdf"], accept_multiple_files=True, key="weekly_checklist_upload")
+        if st.button("🔍 Recognize images (only if uncached)", disabled=not weekly_files):
+            try:
+                extracted = []
+                cache_hits = 0
+                for uploaded in weekly_files:
+                    rows, was_cached = get_or_create_ocr(uploaded)
+                    extracted.extend(rows)
+                    cache_hits += int(was_cached)
+                install_weekly_review(expand_weekly_rows(extracted, df_projects),
+                                      title=" / ".join(x.name for x in weekly_files)[:100])
+                try:
+                    save_check_draft(st.session_state.weekly_draft_id, st.session_state.weekly_draft_title,
+                                     st.session_state.weekly_review_rows)
+                    st.success(f"Recognized {len(extracted)} potential rows and auto-saved a draft. {cache_hits}/{len(weekly_files)} files came from cache without OCR API requests.")
+                except Exception as save_exc:
+                    st.warning(f"Recognized {len(extracted)} rows, but draft auto-save failed: {save_exc}. Download Excel to avoid losing edits.")
+            except Exception as exc:
+                st.error(f"Recognition/cache error: {exc}")
+                st.info("If the Google Sheets cache cannot be accessed, the image is not processed; this avoids accidental repeated API charges.")
 
     if st.session_state.get("weekly_review_rows") is not None:
-        st.markdown("#### ✏️ Editable Draft")
+        st.markdown("#### ✏️ Editable Draft — no OCR API calls")
         weekly_df = pd.DataFrame(st.session_state.weekly_review_rows)
         if not weekly_df.empty:
             if "Stage" not in weekly_df.columns: weekly_df["Stage"] = ""
@@ -1696,27 +1798,12 @@ elif mode in ("👷 Construction Bulk Checks", "🏢 Other Bulk Checks"):
             st.session_state.weekly_review_rows = _json_safe_rows(reviewed.to_dict("records"))
             current_rows = st.session_state.weekly_review_rows
             st.text_input("Draft name", key="weekly_draft_title")
-            col_save, col_download = st.columns(2)
-            with col_save:
-                if st.button("💾 Save draft to Google Sheets", use_container_width=True):
-                    try:
-                        save_check_draft(st.session_state.weekly_draft_id,
-                                         st.session_state.weekly_draft_title, current_rows)
-                        st.success("Draft saved. Reopen it later from Saved Drafts.")
-                    except Exception as exc:
-                        st.error(f"Draft save failed: {exc}")
-            with col_download:
-                st.download_button("⬇️ Download editable Excel", data=draft_excel_bytes(current_rows),
-                                   file_name=f"check_draft_{st.session_state.get('weekly_draft_id', 'export')}.xlsx",
-                                   mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                                   use_container_width=True)
             issues = validate_weekly_rows(current_rows, df_projects, other_mode=is_other_bulk)
             if issues:
                 st.warning(f"{len(issues)} items to review: " + "; ".join(issues[:8]))
-            st.caption("Drafts are not issued checks. Saving a draft never allocates check numbers or writes issuance history.")
             if st.button("➕ Add reviewed checks to batch", disabled=bool(issues)):
                 try:
-                    history = read_file(GS_SPREADSHEET_NAME, GS_WORKSHEET_NAME)
+                    history = read_issuance_history()
                     staged = list(st.session_state.payroll_list)
                     for row in current_rows:
                         project = str(row["Project"])
@@ -1901,7 +1988,7 @@ elif mode in ("👷 Construction Bulk Checks", "🏢 Other Bulk Checks"):
         if st.button("➕ Add", type="primary", use_container_width=True):
             final_project_val = add_proj
 
-            history = read_file(GS_SPREADSHEET_NAME, GS_WORKSHEET_NAME)
+            history = read_issuance_history()
             next_chk = next_number_for_account(add_account, history, st.session_state.payroll_list,
                                                 account_start_nums.get(add_account, 1001))
 
@@ -1994,13 +2081,13 @@ elif mode in ("👷 Construction Bulk Checks", "🏢 Other Bulk Checks"):
         duplicates = df_payroll_input.assign(_account=df_payroll_input["Account"].astype(str).str.strip()).duplicated(subset=["_account", "Check #"], keep=False)
         if duplicates.any():
             st.error("Duplicate Check Numbers for the same Account. Edit them before generating checks.")
-        current_history = read_file(GS_SPREADSHEET_NAME, GS_WORKSHEET_NAME)
+        current_history = read_issuance_history()
         history_collisions = [(str(r["Account"]), int(r["Check #"])) for _, r in df_payroll_input.iterrows()
                               if pd.notna(r["Check #"]) and int(r["Check #"]) in used_numbers_for_account(r["Account"], current_history)]
         if history_collisions:
             st.error(f"Already issued check numbers (Account, Check #): {history_collisions[:10]}")
         if st.button(f"🚀 Confirm & Batch Generate {len(df_payroll_input)} Checks", type="primary", use_container_width=True, disabled=bool(duplicates.any()) or bool(history_collisions)):
-            fresh_history = read_file(GS_SPREADSHEET_NAME, GS_WORKSHEET_NAME)
+            fresh_history = read_issuance_history()
             if any(int(r["Check #"]) in used_numbers_for_account(r["Account"], fresh_history)
                    for _, r in df_payroll_input.iterrows()):
                 st.error("A check number has already been issued for its Account. Refresh and re-number before continuing.")
