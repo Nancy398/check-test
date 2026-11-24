@@ -1271,6 +1271,27 @@ mode = st.sidebar.radio(
     ],
 )
 
+# ----------------- ChatGPT Check Excel shortcut -----------------
+# Optional: set CHATGPT_CHECK_ASSISTANT_URL in Streamlit Secrets to your own
+# private chat URL (https://chatgpt.com/c/...). Keep this URL private.
+try:
+    chatgpt_check_url = str(st.secrets.get("CHATGPT_CHECK_ASSISTANT_URL", "")).strip()
+except Exception:
+    chatgpt_check_url = ""
+if not chatgpt_check_url.startswith(("https://chatgpt.com/", "https://chat.openai.com/")):
+    chatgpt_check_url = "https://chatgpt.com/"
+
+st.sidebar.divider()
+st.sidebar.markdown("### 🤖 Check Excel Assistant")
+st.sidebar.caption("Send payroll photos to ChatGPT and prepare an Excel import with Google Sheets Stage history.")
+st.sidebar.link_button(
+    "🤖 Generate Check Excel",
+    chatgpt_check_url,
+    use_container_width=True,
+)
+if chatgpt_check_url == "https://chatgpt.com/":
+    st.sidebar.caption("To open your specific conversation, set CHATGPT_CHECK_ASSISTANT_URL in Streamlit Secrets.")
+
 # ==============================================================================
 # 场景 1：单张手动生成支票
 # ==============================================================================
