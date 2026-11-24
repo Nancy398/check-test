@@ -319,14 +319,38 @@ def read_file(name, sheet):
         return pd.DataFrame()
 
 def read_issuance_history():
-    """Include old Sheet1 checks when allocating numbers or finding prior stages."""
-    current = read_file(GS_SPREADSHEET_NAME, GS_WORKSHEET_NAME)
-    legacy = read_file(GS_SPREADSHEET_NAME, LEGACY_HISTORY_SHEET)
-    if current.empty:
-        return legacy
-    if legacy.empty:
-        return current
-    return pd.concat([legacy, current], ignore_index=True, sort=False)
+    """Read both issuance tabs safely, even when a sheet has duplicate headers.
+
+    Construction Check is the only destination for NEW checks. Sheet1 is read-only
+    legacy history, used to avoid check-number reuse and to find prior Stages.
+    """
+    columns = [
+        "Check Number", "Issue Date", "Company", "Account", "Project",
+        "Stage", "Payee Name", "Amount", "Memo", "PDF Link", "Project ID"
+    ]
+
+    def normalize(df):
+        if df is None or df.empty:
+            return pd.DataFrame(columns=columns)
+        df = df.copy()
+        df.columns = [str(c).strip() for c in df.columns]
+        # A duplicate Sheet header makes pandas concat raise InvalidIndexError.
+        # For duplicates, prefer the first nonempty value in each row.
+        result = pd.DataFrame(index=df.index)
+        for name in columns:
+            matching = df.loc[:, df.columns == name]
+            if matching.shape[1] == 0:
+                result[name] = ""
+            elif matching.shape[1] == 1:
+                result[name] = matching.iloc[:, 0].fillna("")
+            else:
+                cleaned = matching.replace(r"^\\s*$", pd.NA, regex=True)
+                result[name] = cleaned.bfill(axis=1).iloc[:, 0].fillna("")
+        return result
+
+    legacy = normalize(read_file(GS_SPREADSHEET_NAME, LEGACY_HISTORY_SHEET))
+    current = normalize(read_file(GS_SPREADSHEET_NAME, GS_WORKSHEET_NAME))
+    return pd.concat([legacy, current], ignore_index=True)
 
 
 # ----------------- 3. 保存写入 Google Sheets -----------------
